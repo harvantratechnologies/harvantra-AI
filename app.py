@@ -7,33 +7,37 @@ import time
 from datetime import datetime
 from urllib.parse import quote
 
-# =====================================================
-# APP CONFIG
-# =====================================================
+# =========================================================
+# HARVANTRA AI - CONFIGURATION
+# =========================================================
 
 st.set_page_config(
     page_title="Harvantra AI",
     page_icon="🛡️",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-APP = "Harvantra AI"
-DB = "harvantra_crm.db"
+APP_NAME = "Harvantra AI"
+DB_PATH = "harvantra_crm.db"
 
-COMPANY = "https://harvantratechnologies.github.io/"
-GITHUB = "https://github.com/harvantratechnologies"
-LINKEDIN = "https://www.linkedin.com/in/haris-hassan-65b0523a8/"
-
-HEADERS = {
-    "User-Agent": "HarvantraAI/1.0 (https://harvantratechnologies.github.io/)"
-}
+COMPANY_WEBSITE = "https://harvantratechnologies.github.io/"
+GITHUB_PORTFOLIO = "https://github.com/harvantratechnologies"
+FOUNDER_LINKEDIN = "https://www.linkedin.com/in/haris-hassan-65b0523a8/"
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
-# =====================================================
-# 30 OFFICIAL SERVICES + UNIQUE PITCHES
-# =====================================================
+HEADERS = {
+    "User-Agent": (
+        "HarvantraAI/1.0 "
+        "(https://harvantratechnologies.github.io/)"
+    )
+}
+
+# =========================================================
+# OFFICIAL 30 HARVANTRA SERVICES
+# =========================================================
 
 SERVICES = {
     "Managed SOC & 24/7 Security Monitoring":
@@ -127,20 +131,21 @@ SERVICES = {
         "We can provide managed IT support and helpdesk assistance for routine technical and infrastructure requirements."
 }
 
-# =====================================================
+# =========================================================
 # DATABASE
-# =====================================================
+# =========================================================
 
-def db():
-    return sqlite3.connect(DB, check_same_thread=False)
+def get_db():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 
-def init_db():
-    con = db()
+def initialize_database():
+    con = get_db()
+
     con.execute("""
         CREATE TABLE IF NOT EXISTS leads (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            business_name TEXT,
+            business_name TEXT NOT NULL,
             website TEXT,
             phone TEXT,
             email TEXT,
@@ -149,31 +154,60 @@ def init_db():
             source TEXT,
             status TEXT DEFAULT 'New',
             notes TEXT,
-            created_at TEXT
+            consent_basis TEXT DEFAULT '',
+            created_at TEXT,
+            updated_at TEXT
         )
     """)
+
+    con.commit()
+
+    # Add missing columns to an older database safely.
+    columns = {
+        row[1]
+        for row in con.execute(
+            "PRAGMA table_info(leads)"
+        ).fetchall()
+    }
+
+    if "consent_basis" not in columns:
+        con.execute(
+            "ALTER TABLE leads ADD COLUMN consent_basis TEXT DEFAULT ''"
+        )
+
+    if "updated_at" not in columns:
+        con.execute(
+            "ALTER TABLE leads ADD COLUMN updated_at TEXT"
+        )
+
     con.commit()
     con.close()
 
 
-def all_leads():
-    con = db()
+def get_leads():
+    con = get_db()
+
     df = pd.read_sql_query(
-        "SELECT * FROM leads ORDER BY id DESC", con
+        "SELECT * FROM leads ORDER BY id DESC",
+        con
     )
+
     con.close()
     return df
 
 
-def save_lead(data):
-    con = db()
+def add_lead(data):
+    con = get_db()
+
+    now = datetime.now().isoformat(timespec="seconds")
 
     con.execute("""
         INSERT INTO leads (
             business_name, website, phone, email,
-            address, service, source, status, notes, created_at
+            address, service, source, status, notes,
+            consent_basis, created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         data.get("business_name", ""),
         data.get("website", ""),
@@ -184,67 +218,104 @@ def save_lead(data):
         data.get("source", ""),
         data.get("status", "New"),
         data.get("notes", ""),
-        datetime.now().isoformat(timespec="seconds")
+        data.get("consent_basis", ""),
+        now,
+        now
     ))
 
     con.commit()
     con.close()
 
 
-def update_status(lead_id, status):
-    con = db()
-    con.execute(
-        "UPDATE leads SET status=? WHERE id=?",
-        (status, int(lead_id))
+def update_lead(lead_id, **fields):
+    allowed = {
+        "business_name", "website", "phone", "email",
+        "address", "service", "source", "status",
+        "notes", "consent_basis"
+    }
+
+    updates = {
+        key: value
+        for key, value in fields.items()
+        if key in allowed
+    }
+
+    if not updates:
+        return
+
+    updates["updated_at"] = datetime.now().isoformat(
+        timespec="seconds"
     )
+
+    set_clause = ", ".join(
+        f"{key}=?" for key in updates
+    )
+
+    values = list(updates.values()) + [int(lead_id)]
+
+    con = get_db()
+
+    con.execute(
+        f"UPDATE leads SET {set_clause} WHERE id=?",
+        values
+    )
+
     con.commit()
     con.close()
 
 
 def delete_lead(lead_id):
-    con = db()
+    con = get_db()
+
     con.execute(
         "DELETE FROM leads WHERE id=?",
         (int(lead_id),)
     )
+
     con.commit()
     con.close()
 
 
-def save_discovered(records):
-    current = all_leads()
-    existing = set()
+# =========================================================
+# DUPLICATE CHECKING
+# =========================================================
 
-    if not current.empty:
-        existing = set(
-            (
-                str(r["business_name"]).lower(),
-                str(r["website"]).lower()
-            )
-            for _, r in current.iterrows()
-        )
+def save_discovered_leads(records):
+    existing = get_leads()
 
-    count = 0
+    existing_keys = set()
 
-    for r in records:
+    if not existing.empty:
+        for _, row in existing.iterrows():
+            existing_keys.add((
+                str(row["business_name"]).strip().lower(),
+                str(row["website"]).strip().lower()
+            ))
+
+    saved = 0
+    duplicates = 0
+
+    for record in records:
         key = (
-            r["business_name"].lower(),
-            r["website"].lower()
+            record["business_name"].strip().lower(),
+            record["website"].strip().lower()
         )
 
-        if key in existing:
+        if key in existing_keys:
+            duplicates += 1
             continue
 
-        save_lead(r)
-        existing.add(key)
-        count += 1
+        add_lead(record)
 
-    return count
+        existing_keys.add(key)
+        saved += 1
+
+    return saved, duplicates
 
 
-# =====================================================
-# FREE GEOCODING - NOMINATIM
-# =====================================================
+# =========================================================
+# FREE LOCATION SEARCH - NOMINATIM
+# =========================================================
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def geocode_location(location):
@@ -260,11 +331,12 @@ def geocode_location(location):
     )
 
     response.raise_for_status()
+
     results = response.json()
 
     if not results:
         raise ValueError(
-            "Location nahi mili. City aur country ka naam check karein."
+            "Location not found. City and country check karein."
         )
 
     return {
@@ -274,20 +346,20 @@ def geocode_location(location):
     }
 
 
-# =====================================================
+# =========================================================
 # FREE BUSINESS DISCOVERY - OVERPASS
-# =====================================================
+# =========================================================
 
 def discover_businesses(location, radius_km, limit):
     place = geocode_location(location)
 
     lat = place["lat"]
     lon = place["lon"]
+
     radius = int(radius_km * 1000)
 
-    # Search only businesses with a website tag.
     query = f"""
-    [out:json][timeout:35];
+    [out:json][timeout:40];
     (
       nwr(around:{radius},{lat},{lon})[name][website];
       nwr(around:{radius},{lat},{lon})[name]["contact:website"];
@@ -303,21 +375,29 @@ def discover_businesses(location, radius_km, limit):
     )
 
     response.raise_for_status()
+
     elements = response.json().get("elements", [])
 
     records = []
     seen = set()
 
-    business_keys = [
-        "shop", "office", "amenity", "craft",
-        "tourism", "healthcare", "industrial",
-        "leisure", "club"
+    business_categories = [
+        "shop",
+        "office",
+        "amenity",
+        "craft",
+        "tourism",
+        "healthcare",
+        "industrial",
+        "leisure",
+        "club"
     ]
 
     for item in elements:
         tags = item.get("tags", {})
 
         name = tags.get("name", "").strip()
+
         website = (
             tags.get("website")
             or tags.get("contact:website")
@@ -327,8 +407,10 @@ def discover_businesses(location, radius_km, limit):
         if not name or not website:
             continue
 
-        # Exclude objects without a recognizable business category.
-        if not any(key in tags for key in business_keys):
+        if not any(
+            category in tags
+            for category in business_categories
+        ):
             continue
 
         if website.startswith("www."):
@@ -337,7 +419,10 @@ def discover_businesses(location, radius_km, limit):
         if not website.startswith(("http://", "https://")):
             continue
 
-        key = (name.lower(), website.lower())
+        key = (
+            name.lower(),
+            website.lower()
+        )
 
         if key in seen:
             continue
@@ -356,20 +441,26 @@ def discover_businesses(location, radius_km, limit):
             or ""
         )
 
+        address_parts = [
+            tags.get("addr:housenumber", ""),
+            tags.get("addr:street", ""),
+            tags.get("addr:city", ""),
+            tags.get("addr:state", ""),
+            tags.get("addr:country", "")
+        ]
+
         address = ", ".join(
-            x for x in [
-                tags.get("addr:street", ""),
-                tags.get("addr:city", ""),
-                tags.get("addr:state", ""),
-                tags.get("addr:country", "")
-            ] if x
+            part for part in address_parts if part
         )
 
         if not address:
             address = place["display_name"]
 
         category = next(
-            (key for key in business_keys if key in tags),
+            (
+                key for key in business_categories
+                if key in tags
+            ),
             "business"
         )
 
@@ -380,9 +471,13 @@ def discover_businesses(location, radius_km, limit):
             "email": email,
             "address": address,
             "service": list(SERVICES.keys())[0],
-            "source": "OpenStreetMap / Overpass",
+            "source": "OpenStreetMap",
             "status": "New",
-            "notes": f"OSM category: {category}. Verify details before outreach."
+            "notes": (
+                f"OSM category: {category}. "
+                "Verify business information before contacting."
+            ),
+            "consent_basis": ""
         })
 
         if len(records) >= limit:
@@ -391,16 +486,18 @@ def discover_businesses(location, radius_km, limit):
     return records
 
 
-# =====================================================
-# OUTREACH MESSAGE GENERATOR
-# =====================================================
+# =========================================================
+# OUTREACH GENERATION
+# =========================================================
 
-def generate_email(name, service, website=""):
+def generate_email(business_name, service, website=""):
     pitch = SERVICES[service]
 
-    subject = f"IT & Cybersecurity Support for {name}"
+    subject = (
+        f"IT & Cybersecurity Support for {business_name}"
+    )
 
-    body = f"""Hello {name} Team,
+    message = f"""Hello {business_name} Team,
 
 I hope you are doing well.
 
@@ -409,24 +506,25 @@ I am reaching out from Harvantra Technologies, a Pakistan-based IT and cybersecu
 We provide {service}.
 
 How this may help your organization:
+
 {pitch}
 
 We would welcome an opportunity to understand your requirements and discuss whether our services could be relevant.
 
 Company Website:
-{COMPANY}
+{COMPANY_WEBSITE}
 
 GitHub Portfolio:
-{GITHUB}
+{GITHUB_PORTFOLIO}
 
 Founder LinkedIn:
-{LINKEDIN}
+{FOUNDER_LINKEDIN}
 """
 
     if website:
-        body += f"\nYour Website: {website}\n"
+        message += f"\nYour Business Website:\n{website}\n"
 
-    body += """
+    message += """
 If this is relevant to your team, please let us know a suitable time for a brief discussion.
 
 If you do not wish to receive further messages, please let us know.
@@ -435,13 +533,13 @@ Regards,
 Harvantra Technologies
 """
 
-    return subject, body
+    return subject, message
 
 
-def generate_whatsapp(name, service, website=""):
+def generate_whatsapp(business_name, service, website=""):
     pitch = SERVICES[service]
 
-    message = f"""Hello {name} Team,
+    message = f"""Hello {business_name} Team,
 
 I am reaching out from Harvantra Technologies.
 
@@ -450,17 +548,17 @@ We provide {service}.
 {pitch}
 
 Company Website:
-{COMPANY}
+{COMPANY_WEBSITE}
 
 GitHub Portfolio:
-{GITHUB}
+{GITHUB_PORTFOLIO}
 
 Founder LinkedIn:
-{LINKEDIN}
+{FOUNDER_LINKEDIN}
 """
 
     if website:
-        message += f"\nYour Website: {website}\n"
+        message += f"\nYour Business Website:\n{website}\n"
 
     message += """
 Would your team be open to a brief discussion?
@@ -471,16 +569,21 @@ If you do not wish to receive further messages, please let us know.
     return message
 
 
-def whatsapp_url(phone, message):
-    number = re.sub(r"\D", "", str(phone))
+def create_whatsapp_link(phone, message):
+    number = re.sub(r"[^0-9]", "", str(phone))
 
     if not number:
         return ""
 
-    return f"https://wa.me/{number}?text={quote(message)}"
+    return (
+        "https://wa.me/"
+        + number
+        + "?text="
+        + quote(message)
+    )
 
 
-def email_url(email, subject, message):
+def create_email_link(email, subject, message):
     if not email or "@" not in email:
         return ""
 
@@ -491,31 +594,41 @@ def email_url(email, subject, message):
     )
 
 
-# =====================================================
-# CSV IMPORT / EXPORT
-# =====================================================
+# =========================================================
+# CSV IMPORT
+# =========================================================
 
-def import_csv(file):
-    df = pd.read_csv(file)
-    df.columns = [str(c).strip().lower() for c in df.columns]
+def import_csv(uploaded_file):
+    df = pd.read_csv(uploaded_file)
+
+    df.columns = [
+        str(column).strip().lower()
+        for column in df.columns
+    ]
 
     if "business_name" not in df.columns:
-        raise ValueError("CSV mein business_name column required hai.")
+        raise ValueError(
+            "CSV mein business_name column required hai."
+        )
 
-    count = 0
+    imported = 0
 
     for _, row in df.iterrows():
-        name = str(row.get("business_name", "")).strip()
+        name = str(
+            row.get("business_name", "")
+        ).strip()
 
         if not name or name.lower() == "nan":
             continue
 
-        service = str(row.get("service", "")).strip()
+        service = str(
+            row.get("service", "")
+        ).strip()
 
         if service not in SERVICES:
             service = list(SERVICES.keys())[0]
 
-        save_lead({
+        add_lead({
             "business_name": name,
             "website": str(row.get("website", "")),
             "phone": str(row.get("phone", "")),
@@ -524,29 +637,32 @@ def import_csv(file):
             "service": service,
             "source": "CSV Import",
             "status": "New",
-            "notes": str(row.get("notes", ""))
+            "notes": str(row.get("notes", "")),
+            "consent_basis": str(
+                row.get("consent_basis", "")
+            )
         })
 
-        count += 1
+        imported += 1
 
-    return count
+    return imported
 
 
-# =====================================================
-# MAIN APP
-# =====================================================
+# =========================================================
+# INITIALIZE
+# =========================================================
 
-init_db()
+initialize_database()
 
-st.title("🛡️ Harvantra AI")
-st.caption(
-    "Free Business Discovery | 30 Services | Outreach | CRM"
-)
+# =========================================================
+# SIDEBAR
+# =========================================================
 
-st.sidebar.title("Harvantra Technologies")
+st.sidebar.title("🛡️ Harvantra AI")
+st.sidebar.caption("Client Acquisition Platform")
 
 page = st.sidebar.radio(
-    "Navigation",
+    "Main Menu",
     [
         "Dashboard",
         "Business Discovery",
@@ -555,142 +671,245 @@ page = st.sidebar.radio(
         "Outreach Studio",
         "Add Lead",
         "Import / Export",
-        "About & Settings"
+        "Company & Settings"
     ]
 )
 
-# =====================================================
+st.sidebar.divider()
+st.sidebar.caption("Harvantra Technologies")
+st.sidebar.markdown(
+    f"[Company Website]({COMPANY_WEBSITE})"
+)
+st.sidebar.markdown(
+    f"[GitHub Portfolio]({GITHUB_PORTFOLIO})"
+)
+st.sidebar.markdown(
+    f"[Founder LinkedIn]({FOUNDER_LINKEDIN})"
+)
+
+# =========================================================
 # DASHBOARD
-# =====================================================
+# =========================================================
 
 if page == "Dashboard":
-    leads = all_leads()
+    st.title("📊 Harvantra AI Dashboard")
+
+    leads = get_leads()
 
     total = len(leads)
 
-    def count_status(status):
-        return int((leads["status"] == status).sum()) if total else 0
+    def get_count(status):
+        if total == 0:
+            return 0
 
-    a, b, c, d, e = st.columns(5)
+        return int(
+            (leads["status"] == status).sum()
+        )
 
-    a.metric("Total Leads", total)
-    b.metric("New", count_status("New"))
-    c.metric("Contacted", count_status("Contacted"))
-    d.metric("Replied", count_status("Replied"))
-    e.metric("Clients", count_status("Client"))
+    col1, col2, col3, col4, col5 = st.columns(5)
+
+    col1.metric("Total Leads", total)
+    col2.metric("New", get_count("New"))
+    col3.metric("Contacted", get_count("Contacted"))
+    col4.metric("Replied", get_count("Replied"))
+    col5.metric("Clients", get_count("Client"))
 
     st.divider()
-    st.subheader("Recent Leads")
 
-    if total:
+    st.subheader("Recent Business Leads")
+
+    if leads.empty:
+        st.info(
+            "No leads found. Start Business Discovery."
+        )
+    else:
         st.dataframe(
             leads.head(15),
             use_container_width=True,
             hide_index=True
         )
 
-        st.subheader("Lead Status")
-        st.bar_chart(leads["status"].value_counts())
-    else:
-        st.info("Start by discovering or adding your first business leads.")
+        st.subheader("Lead Status Analytics")
 
-    st.subheader("Harvantra's 30 Services")
-    st.write(f"**{len(SERVICES)} service categories available.**")
+        st.bar_chart(
+            leads["status"].value_counts()
+        )
 
+        st.subheader("Service Distribution")
 
-# =====================================================
-# BUSINESS DISCOVERY
-# =====================================================
+        st.bar_chart(
+            leads["service"].value_counts()
+        )
 
-elif page == "Business Discovery":
-    st.header("🌍 Free Business Discovery")
+    st.divider()
 
-    st.info(
-        "No API key required. Searches OpenStreetMap data through Overpass. "
-        "Results are limited by available OSM data and public server capacity."
+    st.subheader("Harvantra Services")
+
+    st.metric(
+        "Available Services",
+        len(SERVICES)
     )
 
-    with st.form("search_form"):
+# =========================================================
+# BUSINESS DISCOVERY
+# =========================================================
+
+elif page == "Business Discovery":
+    st.title("🌍 Business Discovery")
+
+    st.info(
+        "Uses free public OpenStreetMap and Overpass services. "
+        "No API key or credit card is required. "
+        "Only businesses with website information in OSM are searched."
+    )
+
+    with st.form("business_search_form"):
         location = st.text_input(
-            "City / Location",
+            "Location",
             placeholder="Islamabad, Pakistan"
         )
 
         radius = st.slider(
             "Search radius (km)",
-            1, 2, 3, 5,
+            min_value=1,
+            max_value=5,
             value=3
         )
 
-        limit = st.slider(
+        result_limit = st.slider(
             "Maximum results",
-            5, 50, 15
+            min_value=5,
+            max_value=50,
+            value=15
         )
 
         service = st.selectbox(
-            "Assign relevant Harvantra service",
+            "Assign Harvantra service",
             list(SERVICES.keys())
         )
 
-        submit = st.form_submit_button("🔎 Find Businesses")
+        submitted = st.form_submit_button(
+            "🔎 Search Businesses"
+        )
 
-    if submit:
+    if submitted:
         if not location.strip():
-            st.error("Location enter karein.")
+            st.error("Please enter a location.")
         else:
             try:
-                with st.spinner("Searching OpenStreetMap..."):
+                with st.spinner(
+                    "Searching OpenStreetMap..."
+                ):
                     found = discover_businesses(
                         location,
                         radius,
-                        limit
+                        result_limit
                     )
 
-                for item in found:
-                    item["service"] = service
+                for record in found:
+                    record["service"] = service
 
-                st.session_state["found_leads"] = found
+                st.session_state["discovered_leads"] = found
 
-                st.success(f"{len(found)} businesses found.")
+                st.success(
+                    f"{len(found)} businesses discovered."
+                )
+
+            except requests.exceptions.Timeout:
+                st.error(
+                    "Public API timeout. Please wait and try again."
+                )
+
+            except requests.exceptions.RequestException as error:
+                st.error(
+                    f"Network/API error: {error}"
+                )
 
             except Exception as error:
-                st.error(f"Search failed: {error}")
+                st.error(
+                    f"Search error: {error}"
+                )
 
-    found = st.session_state.get("found_leads", [])
+    found = st.session_state.get(
+        "discovered_leads", []
+    )
 
     if found:
+        st.subheader("Review Discovered Businesses")
+
         st.dataframe(
             pd.DataFrame(found),
             use_container_width=True,
             hide_index=True
         )
 
-        if st.button("💾 Save Results to CRM"):
-            saved = save_discovered(found)
-            st.success(f"{saved} new leads saved.")
+        st.caption(
+            "Verify business names, websites and contact details "
+            "before saving or contacting."
+        )
 
+        if st.button("💾 Save Reviewed Leads"):
+            saved, duplicates = save_discovered_leads(found)
 
-# =====================================================
+            st.success(
+                f"{saved} new leads saved. "
+                f"{duplicates} duplicates skipped."
+            )
+
+# =========================================================
 # ALL LEADS CRM
-# =====================================================
+# =========================================================
 
 elif page == "All Leads CRM":
-    st.header("📋 All Leads")
+    st.title("📋 All Leads CRM")
 
-    leads = all_leads()
+    leads = get_leads()
 
     if leads.empty:
-        st.info("No leads yet.")
+        st.info("CRM is currently empty.")
     else:
-        search = st.text_input("Search business")
+        search = st.text_input(
+            "Search business name or website"
+        )
+
+        status_options = [
+            "All",
+            "New",
+            "Qualified",
+            "Contacted",
+            "Replied",
+            "Meeting",
+            "Proposal",
+            "Client",
+            "Not Interested",
+            "Do Not Contact"
+        ]
+
+        status_filter = st.selectbox(
+            "Filter by status",
+            status_options
+        )
 
         filtered = leads.copy()
 
         if search:
             filtered = filtered[
                 filtered["business_name"].str.contains(
-                    search, case=False, na=False
+                    search,
+                    case=False,
+                    na=False
                 )
+                |
+                filtered["website"].str.contains(
+                    search,
+                    case=False,
+                    na=False
+                )
+            ]
+
+        if status_filter != "All":
+            filtered = filtered[
+                filtered["status"] == status_filter
             ]
 
         st.dataframe(
@@ -700,87 +919,180 @@ elif page == "All Leads CRM":
         )
 
         st.divider()
-        st.subheader("Update Lead Status")
 
-        lead_ids = filtered["id"].tolist()
+        st.subheader("Manage Lead")
 
-        if lead_ids:
-            selected = st.selectbox("Lead ID", lead_ids)
+        if not filtered.empty:
+            selected_id = st.selectbox(
+                "Select Lead ID",
+                filtered["id"].tolist()
+            )
 
-            statuses = [
-                "New", "Qualified", "Contacted", "Replied",
-                "Meeting", "Proposal", "Client",
-                "Not Interested", "Do Not Contact"
-            ]
+            selected = filtered[
+                filtered["id"] == selected_id
+            ].iloc[0]
 
-            status = st.selectbox("New Status", statuses)
+            with st.form("lead_update_form"):
+                status = st.selectbox(
+                    "Lead status",
+                    [
+                        "New",
+                        "Qualified",
+                        "Contacted",
+                        "Replied",
+                        "Meeting",
+                        "Proposal",
+                        "Client",
+                        "Not Interested",
+                        "Do Not Contact"
+                    ],
+                    index=(
+                        [
+                            "New",
+                            "Qualified",
+                            "Contacted",
+                            "Replied",
+                            "Meeting",
+                            "Proposal",
+                            "Client",
+                            "Not Interested",
+                            "Do Not Contact"
+                        ].index(selected["status"])
+                        if selected["status"] in [
+                            "New",
+                            "Qualified",
+                            "Contacted",
+                            "Replied",
+                            "Meeting",
+                            "Proposal",
+                            "Client",
+                            "Not Interested",
+                            "Do Not Contact"
+                        ]
+                        else 0
+                    )
+                )
 
-            if st.button("Update Status"):
-                update_status(selected, status)
-                st.success("Status updated. Refresh page to see changes.")
+                email = st.text_input(
+                    "Email",
+                    value=str(selected["email"] or "")
+                )
 
-            if st.button("Delete Lead"):
-                delete_lead(selected)
-                st.success("Lead deleted. Refresh page.")
+                phone = st.text_input(
+                    "Phone",
+                    value=str(selected["phone"] or "")
+                )
 
+                notes = st.text_area(
+                    "Notes",
+                    value=str(selected["notes"] or "")
+                )
 
-# =====================================================
-# 30 SERVICE CATEGORIES
-# =====================================================
+                consent = st.text_input(
+                    "Contact permission / lawful basis notes",
+                    value=str(
+                        selected["consent_basis"] or ""
+                    )
+                )
+
+                save = st.form_submit_button(
+                    "Update Lead"
+                )
+
+            if save:
+                update_lead(
+                    selected_id,
+                    status=status,
+                    email=email,
+                    phone=phone,
+                    notes=notes,
+                    consent_basis=consent
+                )
+
+                st.success(
+                    "Lead updated. Refresh to see changes."
+                )
+
+            if st.button("Delete Selected Lead"):
+                delete_lead(selected_id)
+                st.success(
+                    "Lead deleted. Refresh the page."
+                )
+
+# =========================================================
+# SERVICE CATEGORIES
+# =========================================================
 
 elif page == "30 Service Categories":
-    st.header("🗂️ Service-Wise Leads")
+    st.title("🗂️ 30 Service Categories")
 
-    leads = all_leads()
-    tabs = st.tabs(list(SERVICES.keys()))
+    leads = get_leads()
 
-    for tab, (service, pitch) in zip(tabs, SERVICES.items()):
+    tabs = st.tabs(
+        list(SERVICES.keys())
+    )
+
+    for tab, (service, pitch) in zip(
+        tabs,
+        SERVICES.items()
+    ):
         with tab:
+            st.subheader(service)
             st.write(pitch)
 
             if leads.empty:
                 st.info("No leads available.")
             else:
-                subset = leads[leads["service"] == service]
+                service_leads = leads[
+                    leads["service"] == service
+                ]
 
-                st.metric("Leads", len(subset))
+                st.metric(
+                    "Total Leads",
+                    len(service_leads)
+                )
 
-                if not subset.empty:
+                if not service_leads.empty:
                     st.dataframe(
-                        subset[[
-                            "id", "business_name", "website",
-                            "phone", "email", "status"
+                        service_leads[[
+                            "id",
+                            "business_name",
+                            "website",
+                            "phone",
+                            "email",
+                            "status"
                         ]],
                         use_container_width=True,
                         hide_index=True
                     )
 
-
-# =====================================================
+# =========================================================
 # OUTREACH STUDIO
-# =====================================================
+# =========================================================
 
 elif page == "Outreach Studio":
-    st.header("✉️ Personalized Outreach Studio")
+    st.title("✉️ Personalized Outreach Studio")
 
-    leads = all_leads()
+    leads = get_leads()
 
     if leads.empty:
-        st.warning("First add or discover leads.")
+        st.warning(
+            "Add or discover business leads first."
+        )
     else:
-        choices = {
-            f'{r["id"]} - {r["business_name"]}': r
-            for _, r in leads.iterrows()
+        options = {
+            f'{row["id"]} - {row["business_name"]}': row
+            for _, row in leads.iterrows()
         }
 
         selected_label = st.selectbox(
-            "Choose business",
-            list(choices.keys())
+            "Select Business",
+            list(options.keys())
         )
 
-        lead = choices[selected_label]
+        lead = options[selected_label]
 
-        business = st.text_input(
+        business_name = st.text_input(
             "Business name",
             value=str(lead["business_name"])
         )
@@ -801,187 +1113,308 @@ elif page == "Outreach Studio":
         )
 
         service = st.selectbox(
-            "Select service",
+            "Relevant Harvantra Service",
             list(SERVICES.keys()),
             index=(
-                list(SERVICES.keys()).index(lead["service"])
-                if lead["service"] in SERVICES else 0
+                list(SERVICES.keys()).index(
+                    lead["service"]
+                )
+                if lead["service"] in SERVICES
+                else 0
             )
         )
 
         subject, email_message = generate_email(
-            business, service, website
+            business_name,
+            service,
+            website
         )
 
         whatsapp_message = generate_whatsapp(
-            business, service, website
+            business_name,
+            service,
+            website
         )
 
         st.divider()
-        st.subheader("Email Draft")
 
-        st.text_input("Subject", value=subject)
+        st.subheader("Email Message")
+
+        st.text_input(
+            "Email Subject",
+            value=subject
+        )
+
         st.text_area(
-            "Email message",
+            "Personalized Email Draft",
             value=email_message,
+            height=330
+        )
+
+        email_link = create_email_link(
+            email,
+            subject,
+            email_message
+        )
+
+        if email_link:
+            st.link_button(
+                "Open Email Draft",
+                email_link
+            )
+        else:
+            st.caption(
+                "Add a valid business email to open an email draft."
+            )
+
+        st.divider()
+
+        st.subheader("WhatsApp Message")
+
+        st.text_area(
+            "Personalized WhatsApp Draft",
+            value=whatsapp_message,
             height=300
         )
 
-        mail = email_url(email, subject, email_message)
-
-        if mail:
-            st.link_button("Open Email Draft", mail)
-
-        st.divider()
-        st.subheader("WhatsApp Draft")
-
-        st.text_area(
-            "WhatsApp message",
-            value=whatsapp_message,
-            height=280
+        whatsapp_link = create_whatsapp_link(
+            phone,
+            whatsapp_message
         )
 
-        wa = whatsapp_url(phone, whatsapp_message)
+        if whatsapp_link:
+            st.link_button(
+                "Open WhatsApp Chat",
+                whatsapp_link
+            )
+        else:
+            st.caption(
+                "Add a phone number with country code."
+            )
 
-        if wa:
-            st.link_button("Open WhatsApp Chat", wa)
-
-        st.caption(
-            "Drafts only. Contact businesses where outreach is lawful; "
-            "respect consent requirements and opt-out requests."
+        st.info(
+            "These are drafts, not automatic messages. "
+            "Use only lawful contact methods, follow WhatsApp policies "
+            "and respect opt-out requests."
         )
 
-        if st.button("Save Service and Contact Details"):
-            con = db()
-            con.execute("""
-                UPDATE leads
-                SET service=?, website=?, email=?, phone=?
-                WHERE id=?
-            """, (
-                service,
-                website,
-                email,
-                phone,
-                int(lead["id"])
-            ))
-            con.commit()
-            con.close()
+        if st.button(
+            "Save Service and Contact Details"
+        ):
+            update_lead(
+                lead["id"],
+                service=service,
+                website=website,
+                email=email,
+                phone=phone
+            )
 
-            st.success("Lead details saved.")
+            st.success(
+                "Business details saved."
+            )
 
-
-# =====================================================
+# =========================================================
 # ADD LEAD
-# =====================================================
+# =========================================================
 
 elif page == "Add Lead":
-    st.header("➕ Add a Business")
+    st.title("➕ Add New Business")
 
-    with st.form("add_form"):
-        name = st.text_input("Business name")
-        website = st.text_input("Website")
-        phone = st.text_input("Phone")
-        email = st.text_input("Email")
-        address = st.text_input("Address")
+    with st.form("manual_lead_form"):
+        business_name = st.text_input(
+            "Business Name"
+        )
+
+        website = st.text_input(
+            "Website"
+        )
+
+        phone = st.text_input(
+            "Phone with country code"
+        )
+
+        email = st.text_input(
+            "Email"
+        )
+
+        address = st.text_input(
+            "Address"
+        )
 
         service = st.selectbox(
-            "Harvantra service",
+            "Harvantra Service",
             list(SERVICES.keys())
+        )
+
+        source = st.selectbox(
+            "Source",
+            [
+                "Manual Research",
+                "OpenStreetMap",
+                "Referral",
+                "LinkedIn",
+                "Website",
+                "CSV Import",
+                "Other"
+            ]
         )
 
         notes = st.text_area("Notes")
 
-        submit = st.form_submit_button("Save Business")
+        consent_basis = st.text_input(
+            "Contact permission / lawful basis notes"
+        )
+
+        submit = st.form_submit_button(
+            "Save Business"
+        )
 
     if submit:
-        if not name.strip():
-            st.error("Business name required.")
+        if not business_name.strip():
+            st.error(
+                "Business name is required."
+            )
         else:
-            save_lead({
-                "business_name": name,
+            add_lead({
+                "business_name": business_name,
                 "website": website,
                 "phone": phone,
                 "email": email,
                 "address": address,
                 "service": service,
-                "source": "Manual",
+                "source": source,
                 "status": "New",
-                "notes": notes
+                "notes": notes,
+                "consent_basis": consent_basis
             })
 
-            st.success("Business saved to CRM.")
+            st.success(
+                "Business successfully saved to CRM."
+            )
 
-
-# =====================================================
-# IMPORT / EXPORT
-# =====================================================
+# =========================================================
+# CSV IMPORT / EXPORT
+# =========================================================
 
 elif page == "Import / Export":
-    st.header("📁 Import / Export Leads")
+    st.title("📁 Import and Export Leads")
 
-    st.write(
-        "CSV must include business_name. Optional columns: "
-        "website, phone, email, address, service, notes."
+    st.subheader("Import CSV")
+
+    st.write("""
+    Required column:
+    - business_name
+
+    Optional columns:
+    - website
+    - phone
+    - email
+    - address
+    - service
+    - notes
+    - consent_basis
+    """)
+
+    uploaded_file = st.file_uploader(
+        "Upload CSV",
+        type=["csv"]
     )
 
-    file = st.file_uploader("Upload CSV", type=["csv"])
+    if uploaded_file:
+        if st.button("Import Leads"):
+            try:
+                imported = import_csv(
+                    uploaded_file
+                )
 
-    if file and st.button("Import CSV"):
-        try:
-            number = import_csv(file)
-            st.success(f"{number} leads imported.")
-        except Exception as error:
-            st.error(str(error))
+                st.success(
+                    f"{imported} leads imported."
+                )
+
+            except Exception as error:
+                st.error(str(error))
 
     st.divider()
 
-    leads = all_leads()
+    st.subheader("Export CRM")
+
+    leads = get_leads()
 
     if not leads.empty:
+        csv_data = leads.to_csv(
+            index=False
+        ).encode("utf-8")
+
         st.download_button(
-            "Download CRM CSV",
-            leads.to_csv(index=False).encode("utf-8"),
+            "⬇️ Download All Leads",
+            data=csv_data,
             file_name="harvantra_leads.csv",
             mime="text/csv"
         )
+    else:
+        st.info(
+            "No leads available for export."
+        )
 
+# =========================================================
+# COMPANY & SETTINGS
+# =========================================================
 
-# =====================================================
-# ABOUT & SETTINGS
-# =====================================================
+elif page == "Company & Settings":
+    st.title("⚙️ Company & Settings")
 
-elif page == "About & Settings":
-    st.header("⚙️ Harvantra AI Settings")
+    st.subheader("Harvantra Technologies")
 
-    st.write("**Company:** Harvantra Technologies")
-    st.write(f"**Website:** {COMPANY}")
-    st.write(f"**GitHub:** {GITHUB}")
-    st.write(f"**Founder LinkedIn:** {LINKEDIN}")
+    st.write(
+        f"Company Website: {COMPANY_WEBSITE}"
+    )
+
+    st.write(
+        f"GitHub Portfolio: {GITHUB_PORTFOLIO}"
+    )
+
+    st.write(
+        f"Founder LinkedIn: {FOUNDER_LINKEDIN}"
+    )
 
     st.divider()
 
-    st.subheader("Free API Information")
+    st.subheader("API Information")
 
-    st.write("Geocoding: OpenStreetMap Nominatim")
-    st.write("Business data: OpenStreetMap Overpass API")
-    st.write("API key: Not required")
+    st.success(
+        "No API key required for the included public OSM services."
+    )
+
+    st.write(
+        "Geocoding: OpenStreetMap Nominatim"
+    )
+
+    st.write(
+        "Business discovery: Overpass API"
+    )
 
     st.markdown(
-        "Business data © [OpenStreetMap contributors]"
+        "Data © [OpenStreetMap contributors]"
         "(https://www.openstreetmap.org/copyright), "
-        "available under the [ODbL licence]"
+        "licensed under [ODbL]"
         "(https://opendatacommons.org/licenses/odbl/)."
     )
 
     st.divider()
 
-    st.subheader("Important")
+    st.subheader("Important Usage Rules")
 
     st.write("""
-    - OSM business data is incomplete and may be outdated.
-    - Verify every business, website and contact detail.
-    - Do not repeatedly query public servers or run bulk scans.
-    - Respect applicable marketing laws and opt-out requests.
-    - This version creates drafts; it does not automatically send messages.
-    - SQLite on temporary cloud storage is not a production backup.
+    1. OpenStreetMap data may be incomplete or outdated.
+    2. Verify businesses and contact information.
+    3. Do not run repeated or excessive public API requests.
+    4. Respect Nominatim and Overpass usage policies.
+    5. Respect marketing laws and opt-out requests.
+    6. Do not send unsolicited WhatsApp bulk messages.
+    7. This application creates outreach drafts only.
+    8. Back up the CRM database regularly.
+    9. Public cloud hosting may not preserve local SQLite files.
     """)
+
+st.sidebar.divider()
+st.sidebar.caption("Harvantra AI | Version 2.0")
