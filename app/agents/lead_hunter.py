@@ -1,145 +1,114 @@
-import hashlib
-from typing import Dict, List
+import re
 import httpx
+from bs4 import BeautifulSoup
 
-OVERPASS_ENDPOINTS = [
-    "https://overpass-api.de/api/interpreter",
-    "https://overpass.kumi.systems/api/interpreter",
-]
-
-GLOBAL_SEED_PROSPECTS: List[Dict] = [
-    {
-        "business_name": "Gulf Cloud & IT Solutions",
-        "website": "https://example.com",
-        "email": "info@gulfcloud-demo.example.com",
-        "phone": "+971-4-000-0001",
-        "category": "cloud_it_services",
-        "city": "Dubai",
-        "country": "UAE",
-        "source": "global_directory",
-    },
-    {
-        "business_name": "Thames FinTech & Advisory",
-        "website": "https://example.org",
-        "email": "contact@thamesfintech-demo.example.com",
-        "phone": "+44-20-0000-0002",
-        "category": "fintech",
-        "city": "London",
-        "country": "UK",
-        "source": "global_directory",
-    },
-    {
-        "business_name": "Riyadh Enterprise Systems",
-        "website": "https://example.net",
-        "email": "hello@riyadhenterprise-demo.example.com",
-        "phone": "+966-11-000-0003",
-        "category": "enterprise_it",
-        "city": "Riyadh",
-        "country": "Saudi Arabia",
-        "source": "global_directory",
-    },
-    {
-        "business_name": "Maple Commerce Group",
-        "website": "https://example.edu",
-        "email": "ops@maplecommerce-demo.example.com",
-        "phone": "+1-416-000-0004",
-        "category": "ecommerce_retail",
-        "city": "Toronto",
-        "country": "Canada",
-        "source": "global_directory",
-    },
-    {
-        "business_name": "Margalla Software & Security",
-        "website": "https://harvantratechnologies.github.io/",
-        "email": "hello@margallasoft-demo.example.com",
-        "phone": "+92-51-000-0005",
-        "category": "software",
-        "city": "Islamabad",
-        "country": "Pakistan",
-        "source": "global_directory",
-    },
-]
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+IGNORED_DOMAINS = ("example.com", "sentry.io", "wixpress.com", "schema.org", "w3.org", "google.com", "facebook.com")
 
 
-def build_dedup_hash(name: str, city: str, website: str | None = None, phone: str | None = None) -> str:
-    raw = f"{(name or '').strip().lower()}|{(city or '').strip().lower()}|{(website or '').strip().lower()}|{(phone or '').strip()}"
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+def extract_email_from_website(website_url: str) -> str:
+    if not website_url:
+        return ""
+    if not website_url.startswith(("http://", "https://")):
+        website_url = "https://" + website_url
+
+    urls_to_try = [website_url.rstrip("/"), website_url.rstrip("/") + "/contact"]
+    headers = {"User-Agent": "Harvantra-Outreach-Bot/1.0 (+https://harvantratechnologies.github.io/)"}
+
+    for url in urls_to_try:
+        try:
+            with httpx.Client(timeout=8.0, follow_redirects=True, headers=headers) as client:
+                resp = client.get(url)
+                if resp.status_code >= 400:
+                    continue
+                soup = BeautifulSoup(resp.text, "html.parser")
+                for a in soup.select("a[href^='mailto:']"):
+                    mail = a.get("href", "").replace("mailto:", "").split("?")[0].strip().lower()
+                    if EMAIL_REGEX.fullmatch(mail) and not any(d in mail for d in IGNORED_DOMAINS):
+                        return mail
+                matches = EMAIL_REGEX.findall(soup.get_text(" ", strip=True))
+                for m in matches:
+                    m_low = m.lower()
+                    if not any(d in m_low for d in IGNORED_DOMAINS) and not m_low.endswith((".png", ".jpg", ".svg")):
+                        return m_low
+        except Exception:
+            continue
+    return ""
 
 
-def _build_query(city: str, limit: int = 12) -> str:
-    safe_city = city.replace('"', "").strip()
-    return f"""
-    [out:json][timeout:20];
-    area["name"="{safe_city}"]["admin_level"~"4|5|6|7|8"]->.searchArea;
-    (
-      nwr["office"](area.searchArea);
-      nwr["shop"~"computer|electronics|it|telecom|software"](area.searchArea);
-    );
-    out center {limit};
-    """
+def discover_worldwide_businesses(cities: list[str], limit_per_city: int = 12) -> list[dict]:
+    results = []
+    seen_emails = set()
 
-
-def hunt_businesses_worldwide(cities: List[str], per_city_limit: int = 8) -> List[Dict]:
-    discovered: List[Dict] = []
-    seen_hashes = set()
-    headers = {"User-Agent": "HarvantraAI/1.0 (harvantratechnologies.github.io)"}
-
-    for city in cities:
-        city_clean = city.strip()
-        if not city_clean:
+    for raw_city in cities:
+        city = raw_city.strip()
+        if not city:
             continue
 
-        query = _build_query(city_clean, limit=per_city_limit)
-        data = None
+        # Discover ANY business (office, shop, clinic, agency, company) with email OR website
+        query = f"""
+        [out:json][timeout:25];
+        area["name"="{city}"]["boundary"="administrative"]->.searchArea;
+        (
+          node["name"]["email"](area.searchArea);
+          way["name"]["email"](area.searchArea);
+          node["name"]["contact:email"](area.searchArea);
+          way["name"]["contact:email"](area.searchArea);
+          node["name"]["website"]["office"](area.searchArea);
+          node["name"]["website"]["shop"](area.searchArea);
+          node["name"]["website"]["amenity"](area.searchArea);
+        );
+        out center 40;
+        """
 
-        for endpoint in OVERPASS_ENDPOINTS:
-            try:
-                with httpx.Client(timeout=20.0, headers=headers) as client:
-                    resp = client.post(endpoint, data={"data": query})
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        break
-            except Exception:
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                resp = client.post(OVERPASS_URL, data={"data": query})
+                resp.raise_for_status()
+                elements = resp.json().get("elements", [])
+        except Exception:
+            elements = []
+
+        city_count = 0
+        for el in elements:
+            if city_count >= limit_per_city:
+                break
+            tags = el.get("tags", {})
+            name = tags.get("name", "").strip()
+            if not name:
                 continue
 
-        if data and "elements" in data:
-            for el in data.get("elements", [])[:per_city_limit]:
-                tags = el.get("tags", {}) or {}
-                name = tags.get("name") or tags.get("name:en")
-                if not name:
-                    continue
+            website = (tags.get("website") or tags.get("contact:website") or "").strip()
+            email = (tags.get("email") or tags.get("contact:email") or "").strip().lower()
 
-                website = tags.get("website") or tags.get("contact:website")
-                if website and not website.startswith(("http://", "https://")):
-                    website = "https://" + website
+            if not email and website:
+                email = extract_email_from_website(website)
 
-                email = tags.get("email") or tags.get("contact:email")
-                phone = tags.get("phone") or tags.get("contact:phone") or tags.get("mobile")
-                category = tags.get("office") or tags.get("shop") or tags.get("craft") or "business"
-                country = tags.get("addr:country") or "Global"
+            if not email or not EMAIL_REGEX.fullmatch(email):
+                continue
+            if any(d in email for d in IGNORED_DOMAINS) or email in seen_emails:
+                continue
 
-                dedup = build_dedup_hash(name, city_clean, website, phone)
-                if dedup not in seen_hashes:
-                    seen_hashes.add(dedup)
-                    discovered.append(
-                        {
-                            "business_name": name.strip()[:200],
-                            "website": website.strip()[:300] if website else None,
-                            "email": email.strip()[:200] if email else None,
-                            "phone": phone.strip()[:60] if phone else None,
-                            "category": str(category).strip()[:120],
-                            "city": city_clean[:100],
-                            "country": str(country)[:100],
-                            "source": "openstreetmap_overpass",
-                            "dedup_hash": dedup,
-                        }
-                    )
+            seen_emails.add(email)
+            category = (
+                tags.get("office")
+                or tags.get("shop")
+                or tags.get("amenity")
+                or tags.get("craft")
+                or "business"
+            )
+            results.append(
+                {
+                    "company_name": name,
+                    "email": email,
+                    "website": website,
+                    "city": city,
+                    "country": tags.get("addr:country", ""),
+                    "industry": category,
+                    "source": "overpass_global_crawler",
+                }
+            )
+            city_count += 1
 
-    if not discovered:
-        for item in GLOBAL_SEED_PROSPECTS:
-            dedup = build_dedup_hash(item["business_name"], item["city"], item["website"], item["phone"])
-            if dedup not in seen_hashes:
-                seen_hashes.add(dedup)
-                discovered.append({**item, "dedup_hash": dedup})
-
-    return discovered
+    return results
