@@ -1,14 +1,17 @@
 from datetime import datetime
+import os
+from typing import Optional
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.agents.business_researcher import fetch_public_website_summary
 from app.agents.email_agent import dispatch_email_outreach
-from app.agents.lead_hunter import hunt_businesses_osm
+from app.agents.lead_hunter import hunt_businesses_worldwide
 from app.agents.reply_agent import process_inbound_reply
 from app.agents.sales_outreach import generate_personalized_outreach
 from app.agents.service_matcher import analyze_and_match_service
@@ -26,7 +29,9 @@ from app.models import (
 )
 from app.seed_services import seed_services
 
-app = FastAPI(title=settings.APP_NAME, version="0.3.0")
+DEFAULT_GLOBAL_CITIES = "Islamabad,Rawalpindi,Lahore,Karachi,Dubai,London,Riyadh,Toronto"
+
+app = FastAPI(title=settings.APP_NAME, version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -48,10 +53,31 @@ class HuntingToggleRequest(BaseModel):
     active: bool
 
 
+class ServiceSelectionRequest(BaseModel):
+    service_number: Optional[int] = None  # None = Auto-match across all 30 services
+    target_cities: Optional[str] = None
+
+
 class InboundWebhookPayload(BaseModel):
     sender_email: str
     message_text: str
     channel: str = "email"
+
+
+def smtp_is_ready() -> bool:
+    return bool(
+        os.getenv("SMTP_HOST", "").strip()
+        and os.getenv("SMTP_USER", "").strip()
+        and os.getenv("SMTP_PASSWORD", "").strip()
+    )
+
+
+def ensure_schema_columns(db: Session) -> None:
+    try:
+        db.execute(text("ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS selected_service_number INTEGER"))
+        db.commit()
+    except Exception:
+        db.rollback()
 
 
 def run_hunting_cycle() -> None:
@@ -61,22 +87,36 @@ def run_hunting_cycle() -> None:
         if not setting or not setting.hunting_active:
             return
 
+        cities_str = setting.target_cities or DEFAULT_GLOBAL_CITIES
+        cities = [c.strip() for c in cities_str.split(",") if c.strip()] or ["Dubai", "London", "Islamabad"]
+
+        services = db.query(ServiceCatalog).order_by(ServiceCatalog.number.asc()).all()
+        service_by_num = {s.number: s for s in services}
+        forced_service = (
+            service_by_num.get(setting.selected_service_number)
+            if setting.selected_service_number
+            else None
+        )
+
+        mode_label = (
+            f"Service #{forced_service.number}: {forced_service.name}"
+            if forced_service
+            else "All 30 Services (AI Auto-Match)"
+        )
+
         db.add(
             AgentJobLog(
-                agent_name="Autonomous_Pipeline",
+                agent_name="Autonomous_Global_Engine",
                 status="running",
-                details=f"Hunting + Research + Outreach cycle started for: {setting.target_cities}",
+                details=f"Mode: {mode_label} | Cities: {', '.join(cities)}",
             )
         )
         db.commit()
 
-        cities = [c.strip() for c in (setting.target_cities or "Islamabad,Rawalpindi").split(",") if c.strip()]
-        raw_businesses = hunt_businesses_osm(cities=cities, per_city_limit=10)
-        services = db.query(ServiceCatalog).all()
-        service_by_num = {s.number: s for s in services}
+        raw_businesses = hunt_businesses_worldwide(cities=cities, per_city_limit=6)
 
         added_count = 0
-        drafted_count = 0
+        sent_count = 0
 
         for item in raw_businesses:
             exists = db.query(Lead).filter(Lead.dedup_hash == item["dedup_hash"]).first()
@@ -89,13 +129,18 @@ def run_hunting_cycle() -> None:
             analysis = analyze_and_match_service(
                 business_name=item["business_name"],
                 category=item.get("category") or "business",
-                city=item.get("city") or "Islamabad",
+                city=item.get("city") or "Global",
                 website=item.get("website"),
                 website_snippet=site_info.get("snippet", ""),
                 services=services,
             )
 
-            matched_svc = service_by_num.get(analysis["service_number"])
+            matched_svc = forced_service or service_by_num.get(analysis["service_number"])
+            match_reason = (
+                f"Targeted by Haris for '{forced_service.name}' in {item.get('city') or 'Global'}."
+                if forced_service
+                else analysis["match_reason"]
+            )
 
             lead = Lead(
                 business_name=item["business_name"],
@@ -104,13 +149,13 @@ def run_hunting_cycle() -> None:
                 phone=item.get("phone"),
                 category=item.get("category"),
                 city=item.get("city"),
-                country=item.get("country", "Pakistan"),
+                country=item.get("country", "Global"),
                 source=item.get("source", "openstreetmap_overpass"),
                 dedup_hash=item["dedup_hash"],
                 research_summary=analysis["research_summary"],
                 identified_needs=analysis["identified_needs"],
                 matched_service_id=matched_svc.id if matched_svc else None,
-                match_reason=analysis["match_reason"],
+                match_reason=match_reason,
                 status="researched_and_matched",
             )
             db.add(lead)
@@ -127,27 +172,20 @@ def run_hunting_cycle() -> None:
                     body=msgs["email_body"],
                     status="draft",
                 )
-                wa_msg = OutreachMessage(
-                    lead_id=lead.id,
-                    channel="whatsapp",
-                    subject=None,
-                    body=msgs["whatsapp_body"],
-                    status="draft",
-                )
                 db.add(email_msg)
-                db.add(wa_msg)
                 db.commit()
                 db.refresh(email_msg)
-                drafted_count += 1
 
-                if lead.email:
-                    dispatch_email_outreach(db, lead, email_msg)
+                if lead.email and smtp_is_ready():
+                    updated = dispatch_email_outreach(db, lead, email_msg)
+                    if updated.status == "sent":
+                        sent_count += 1
 
         db.add(
             AgentJobLog(
-                agent_name="Autonomous_Pipeline",
+                agent_name="Autonomous_Global_Engine",
                 status="completed",
-                details=f"Fetched {len(raw_businesses)} entries; added {added_count} new leads; generated {drafted_count} personalized outreach packages.",
+                details=f"[{mode_label}] Targets: {len(raw_businesses)} | New Leads: {added_count} | Auto-Sent: {sent_count}",
             )
         )
         db.commit()
@@ -156,7 +194,7 @@ def run_hunting_cycle() -> None:
         try:
             db.add(
                 AgentJobLog(
-                    agent_name="Autonomous_Pipeline",
+                    agent_name="Autonomous_Global_Engine",
                     status="failed",
                     details=str(exc)[:500],
                 )
@@ -173,16 +211,24 @@ def on_startup():
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
     try:
+        ensure_schema_columns(db)
         seed_services(db)
         setting = db.query(SystemSetting).first()
         if not setting:
-            db.add(SystemSetting(hunting_active=False, ai_provider=settings.AI_PROVIDER))
+            db.add(
+                SystemSetting(
+                    hunting_active=False,
+                    selected_service_number=None,
+                    ai_provider=settings.AI_PROVIDER,
+                    target_cities=DEFAULT_GLOBAL_CITIES,
+                )
+            )
             db.commit()
     finally:
         db.close()
 
     if not scheduler.running:
-        scheduler.add_job(run_hunting_cycle, "interval", minutes=15, id="hunting_loop", replace_existing=True)
+        scheduler.add_job(run_hunting_cycle, "interval", minutes=10, id="hunting_loop", replace_existing=True)
         scheduler.start()
 
 
@@ -205,6 +251,53 @@ def login(payload: LoginRequest):
     return {"access_token": token, "token_type": "bearer", "user": payload.username}
 
 
+@app.get("/api/services")
+def list_services(db: Session = Depends(get_db), current_user: str = Depends(get_current_user)):
+    services = db.query(ServiceCatalog).order_by(ServiceCatalog.number.asc()).all()
+    return [
+        {
+            "id": s.id,
+            "number": s.number,
+            "name": s.name,
+            "category": s.category,
+            "summary": s.summary,
+            "is_active": s.is_active,
+        }
+        for s in services
+    ]
+
+
+@app.post("/api/hunting/configure")
+def configure_hunting(
+    payload: ServiceSelectionRequest,
+    db: Session = Depends(get_db),
+    current_user: str = Depends(get_current_user),
+):
+    setting = db.query(SystemSetting).first()
+    if not setting:
+        setting = SystemSetting(hunting_active=False, target_cities=DEFAULT_GLOBAL_CITIES)
+        db.add(setting)
+
+    if payload.service_number is not None:
+        svc = db.query(ServiceCatalog).filter(ServiceCatalog.number == payload.service_number).first()
+        if not svc:
+            raise HTTPException(status_code=404, detail="Service number not found")
+        setting.selected_service_number = payload.service_number
+    else:
+        setting.selected_service_number = None
+
+    if payload.target_cities and payload.target_cities.strip():
+        setting.target_cities = payload.target_cities.strip()
+
+    db.commit()
+    db.refresh(setting)
+    return {
+        "selected_service_number": setting.selected_service_number,
+        "target_cities": setting.target_cities,
+        "updated_by": current_user,
+    }
+
+
 @app.get("/api/status")
 def get_system_status(db: Session = Depends(get_db), current_user: str = Depends(get_current_user)):
     setting = db.query(SystemSetting).first()
@@ -218,14 +311,16 @@ def get_system_status(db: Session = Depends(get_db), current_user: str = Depends
     return {
         "user": current_user,
         "hunting_active": setting.hunting_active if setting else False,
+        "selected_service_number": setting.selected_service_number if setting else None,
+        "smtp_auto_send_enabled": smtp_is_ready(),
         "ai_provider": setting.ai_provider if setting else settings.AI_PROVIDER,
         "active_services_count": services_count,
         "total_leads_count": leads_count,
-        "outreach_drafts_or_sent": outreach_count,
-        "emails_sent": sent_count,
+        "outreach_messages_prepared": outreach_count,
+        "emails_sent_automatically": sent_count,
         "needs_human_attention": human_alerts,
         "suppressed_contacts": suppressed_count,
-        "target_cities": setting.target_cities if setting else "Islamabad,Rawalpindi",
+        "target_cities": setting.target_cities if setting else DEFAULT_GLOBAL_CITIES,
         "last_job": {
             "status": last_job.status,
             "details": last_job.details,
@@ -244,10 +339,12 @@ def toggle_hunting(
 ):
     setting = db.query(SystemSetting).first()
     if not setting:
-        setting = SystemSetting(hunting_active=payload.active)
+        setting = SystemSetting(hunting_active=payload.active, target_cities=DEFAULT_GLOBAL_CITIES)
         db.add(setting)
     else:
         setting.hunting_active = payload.active
+        if not setting.target_cities:
+            setting.target_cities = DEFAULT_GLOBAL_CITIES
     db.commit()
     db.refresh(setting)
 
@@ -259,7 +356,7 @@ def toggle_hunting(
 
 @app.get("/api/leads")
 def list_leads(db: Session = Depends(get_db), current_user: str = Depends(get_current_user)):
-    leads = db.query(Lead).order_by(Lead.id.desc()).limit(50).all()
+    leads = db.query(Lead).order_by(Lead.id.desc()).limit(60).all()
     services = {s.id: f"#{s.number} {s.name}" for s in db.query(ServiceCatalog).all()}
     result = []
     for l in leads:
@@ -273,6 +370,7 @@ def list_leads(db: Session = Depends(get_db), current_user: str = Depends(get_cu
                 "id": l.id,
                 "business_name": l.business_name,
                 "city": l.city,
+                "country": l.country,
                 "category": l.category,
                 "website": l.website,
                 "email": l.email,
@@ -324,47 +422,99 @@ def home():
     <head>
       <meta charset="UTF-8" />
       <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-      <title>Harvantra AI – Autonomous Command Center</title>
+      <title>Harvantra AI – Autonomous SaaS Command Center</title>
       <style>
-        body { font-family: Arial, sans-serif; background: #0b1120; color: #f8fafc; margin: 0; padding: 24px; }
-        .card { max-width: 900px; margin: 20px auto; background: #111827; padding: 24px; border-radius: 12px; border: 1px solid #1f2937; }
-        input, textarea { width: 100%; padding: 10px; margin: 8px 0 14px; border-radius: 8px; border: 1px solid #374151; background: #0f172a; color: #fff; box-sizing: border-box; }
-        button { padding: 12px 18px; border: none; border-radius: 8px; background: #2563eb; color: #fff; font-weight: bold; cursor: pointer; }
+        * { box-sizing: border-box; }
+        body { font-family: Inter, Arial, sans-serif; background: #070d19; color: #f1f5f9; margin: 0; padding: 20px; }
+        .wrap { max-width: 1120px; margin: 0 auto; }
+        .topbar { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; background: #0f172a; border: 1px solid #1e293b; padding: 18px 22px; border-radius: 14px; margin-bottom: 18px; }
+        .brand h1 { margin: 0; font-size: 20px; color: #38bdf8; }
+        .brand p { margin: 4px 0 0; font-size: 13px; color: #94a3b8; }
+        .links a { color: #93c5fd; text-decoration: none; margin-left: 14px; font-size: 13px; }
+        .grid4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin-bottom: 18px; }
+        .stat { background: #0f172a; border: 1px solid #1e293b; border-radius: 12px; padding: 16px; }
+        .stat .label { font-size: 12px; color: #94a3b8; text-transform: uppercase; }
+        .stat .val { font-size: 26px; font-weight: bold; margin-top: 6px; color: #f8fafc; }
+        .card { background: #0f172a; border: 1px solid #1e293b; border-radius: 14px; padding: 20px; margin-bottom: 18px; }
+        h2, h3 { margin-top: 0; }
+        select, input, textarea { width: 100%; padding: 11px 12px; margin: 8px 0 14px; border-radius: 9px; border: 1px solid #334155; background: #070d19; color: #f8fafc; font-size: 14px; }
+        button { padding: 12px 18px; border: none; border-radius: 9px; background: #2563eb; color: #fff; font-weight: 600; cursor: pointer; font-size: 14px; }
         button:hover { background: #1d4ed8; }
-        .hunt-btn { width: 100%; background: #16a34a; margin-top: 10px; font-size: 15px; }
+        .hunt-btn { width: 100%; background: #16a34a; font-size: 16px; padding: 15px; margin-top: 8px; }
+        .hunt-btn:hover { background: #15803d; }
         .hunt-btn.stop { background: #dc2626; }
-        .lead-item { background: #0f172a; border: 1px solid #1e293b; border-radius: 8px; padding: 14px; margin-top: 12px; }
-        .msg-box { background: #090d16; border-left: 3px solid #38bdf8; padding: 10px; margin-top: 8px; font-size: 13px; white-space: pre-wrap; }
-        pre { background: #090d16; padding: 12px; border-radius: 8px; overflow-x: auto; font-size: 12px; }
+        .hunt-btn.stop:hover { background: #b91c1c; }
+        .row2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; }
+        .lead-card { background: #070d19; border: 1px solid #1e293b; border-radius: 11px; padding: 15px; margin-top: 12px; }
+        .badge { display: inline-block; padding: 3px 9px; border-radius: 999px; font-size: 11px; font-weight: 600; background: #1e293b; color: #38bdf8; }
+        .msg-box { background: #0d1526; border-left: 3px solid #38bdf8; padding: 12px; margin-top: 10px; border-radius: 6px; font-size: 13px; white-space: pre-wrap; line-height: 1.45; }
       </style>
     </head>
     <body>
-      <div class="card" id="loginBox" style="max-width:460px;">
-        <h2>Harvantra AI Login</h2>
-        <p style="color:#94a3b8;font-size:14px;">Sign in to Harvantra AI Command Center</p>
-        <input id="username" placeholder="Username" />
-        <input id="password" type="password" placeholder="Password" />
-        <button style="width:100%;" onclick="login()">Login</button>
-        <p id="loginMsg" style="color:#f87171;"></p>
-      </div>
-
-      <div class="card" id="dashBox" style="display:none;">
-        <h2>Harvantra AI – Autonomous Client Acquisition</h2>
-        <p id="statusText" style="color:#94a3b8;"></p>
-        <button id="huntBtn" class="hunt-btn" onclick="toggleHunting()">START AI CLIENT HUNTING</button>
-        <div style="margin-top:12px;">
-          <button onclick="loadAll()">Refresh Status, Leads &amp; Inbox</button>
+      <div class="wrap">
+        <div class="card" id="loginBox" style="max-width:440px; margin: 60px auto;">
+          <h2>Harvantra AI Login</h2>
+          <p style="color:#94a3b8;font-size:14px;">Sign in to your autonomous client acquisition dashboard</p>
+          <input id="username" placeholder="Username" />
+          <input id="password" type="password" placeholder="Password" />
+          <button style="width:100%;" onclick="login()">Login to Dashboard</button>
+          <p id="loginMsg" style="color:#f87171;margin-top:10px;"></p>
         </div>
-        <pre id="output">Loading...</pre>
 
-        <h3>Discovered Leads &amp; Tailored Outreach Messages</h3>
-        <div id="leadsList">Loading...</div>
+        <div id="dashBox" style="display:none;">
+          <div class="topbar">
+            <div class="brand">
+              <h1>Harvantra AI – Autonomous Client Engine</h1>
+              <p>Founder: Haris Hassan | Worldwide Client Hunting &amp; 30-Service Outreach</p>
+            </div>
+            <div class="links">
+              <a href="https://harvantratechnologies.github.io/" target="_blank">Website</a>
+              <a href="https://www.linkedin.com/in/haris-hassan-65b0523a8/" target="_blank">LinkedIn</a>
+              <a href="https://github.com/harvantratechnologies" target="_blank">GitHub</a>
+            </div>
+          </div>
 
-        <h3 style="margin-top:28px;">AI Reply Simulator &amp; Conversation Log</h3>
-        <input id="simEmail" placeholder="Lead Email (e.g. info@example.com)" />
-        <textarea id="simMsg" rows="2" placeholder="Simulate client reply (e.g. Can you send pricing for VAPT?)"></textarea>
-        <button onclick="simulateReply()">Test AI Reply Agent</button>
-        <div id="convList" style="margin-top:12px;"></div>
+          <div class="grid4">
+            <div class="stat"><div class="label">Total Leads</div><div class="val" id="mLeads">0</div></div>
+            <div class="stat"><div class="label">Auto-Emails Sent</div><div class="val" id="mSent">0</div></div>
+            <div class="stat"><div class="label">SMTP Auto-Send</div><div class="val" id="mSmtp">OFF</div></div>
+            <div class="stat"><div class="label">Human Alerts</div><div class="val" id="mAlerts">0</div></div>
+          </div>
+
+          <div class="card">
+            <h3>1. Select Service &amp; Worldwide Targets</h3>
+            <div class="row2">
+              <div>
+                <label style="font-size:13px;color:#cbd5e1;">Choose Service (All 30 or Specific 1–30)</label>
+                <select id="serviceSelect"></select>
+              </div>
+              <div>
+                <label style="font-size:13px;color:#cbd5e1;">Target Worldwide Cities (comma separated)</label>
+                <input id="citiesInput" placeholder="Dubai,London,Riyadh,Toronto,Islamabad,Lahore,Karachi" />
+              </div>
+            </div>
+            <div style="display:flex;gap:10px;flex-wrap:wrap;">
+              <button onclick="saveConfig()">Save Service &amp; Cities</button>
+              <button onclick="loadAll()" style="background:#334155;">Refresh Dashboard</button>
+            </div>
+
+            <button id="huntBtn" class="hunt-btn" onclick="toggleHunting()">START AI CLIENT HUNTING</button>
+            <p id="jobStatus" style="color:#94a3b8;font-size:13px;margin-top:10px;"></p>
+          </div>
+
+          <div class="card">
+            <h3>2. Discovered Worldwide Clients &amp; Personalized Outreach (With Your Links)</h3>
+            <div id="leadsList">Loading...</div>
+          </div>
+
+          <div class="card">
+            <h3>3. Client Reply Handler &amp; Conversation Log</h3>
+            <input id="simEmail" placeholder="Client Email" />
+            <textarea id="simMsg" rows="2" placeholder="Paste or simulate client reply..."></textarea>
+            <button onclick="simulateReply()">Process Client Reply</button>
+            <div id="convList" style="margin-top:12px;"></div>
+          </div>
+        </div>
       </div>
 
       <script>
@@ -387,39 +537,82 @@ def home():
           token = data.access_token;
           document.getElementById("loginBox").style.display = "none";
           document.getElementById("dashBox").style.display = "block";
+          await loadServices();
           await loadAll();
+        }
+
+        async function loadServices() {
+          const res = await fetch("/api/services", {
+            headers: { "Authorization": "Bearer " + token }
+          });
+          const services = await res.json();
+          const sel = document.getElementById("serviceSelect");
+          sel.innerHTML = `<option value="">All 30 Harvantra Services (AI Auto-Match per Client)</option>` +
+            services.map(s => `<option value="${s.number}">#${s.number} — ${s.name}</option>`).join("");
+        }
+
+        async function saveConfig() {
+          const rawVal = document.getElementById("serviceSelect").value;
+          const service_number = rawVal ? parseInt(rawVal, 10) : null;
+          const target_cities = document.getElementById("citiesInput").value;
+          const res = await fetch("/api/hunting/configure", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": "Bearer " + token
+            },
+            body: JSON.stringify({ service_number, target_cities })
+          });
+          if (res.ok) {
+            alert("Service & target cities saved!");
+            await loadAll();
+          }
         }
 
         async function loadAll() {
           const headers = { "Authorization": "Bearer " + token };
           const sRes = await fetch("/api/status", { headers });
           const data = await sRes.json();
+
           isHunting = data.hunting_active;
+          document.getElementById("mLeads").innerText = data.total_leads_count;
+          document.getElementById("mSent").innerText = data.emails_sent_automatically;
+          document.getElementById("mSmtp").innerText = data.smtp_auto_send_enabled ? "ACTIVE" : "DRAFT ONLY";
+          document.getElementById("mAlerts").innerText = data.needs_human_attention;
+          document.getElementById("citiesInput").value = data.target_cities || "";
+          if (data.selected_service_number) {
+            document.getElementById("serviceSelect").value = String(data.selected_service_number);
+          }
+
           const btn = document.getElementById("huntBtn");
-          btn.innerText = isHunting ? "STOP AI CLIENT HUNTING (RUNNING IN BACKGROUND)" : "START AI CLIENT HUNTING";
+          btn.innerText = isHunting ? "STOP AI CLIENT HUNTING (RUNNING AUTOMATICALLY)" : "START AI CLIENT HUNTING";
           btn.className = isHunting ? "hunt-btn stop" : "hunt-btn";
-          document.getElementById("statusText").innerText =
-            `User: ${data.user} | Services: ${data.active_services_count} | Leads: ${data.total_leads_count} | Emails Sent: ${data.emails_sent} | Human Alerts: ${data.needs_human_attention}`;
-          document.getElementById("output").innerText = JSON.stringify(data, null, 2);
+
+          const lastJob = data.last_job ? `${data.last_job.status}: ${data.last_job.details}` : "Ready for one-click hunt.";
+          document.getElementById("jobStatus").innerText = `Status: ${lastJob}`;
 
           const lRes = await fetch("/api/leads", { headers });
           const leads = await lRes.json();
           const container = document.getElementById("leadsList");
           container.innerHTML = leads.length ? leads.map(l => `
-            <div class="lead-item">
-              <strong>${l.business_name}</strong> (${l.city || "Pakistan"} - ${l.category || "N/A"}) | Status: <b>${l.status}</b><br/>
-              <span style="color:#38bdf8;">Matched Service: ${l.matched_service}</span><br/>
-              <span style="color:#94a3b8;font-size:13px;">Website: ${l.website || "N/A"} | Email: ${l.email || "N/A"}</span>
-              <p style="font-size:13px;margin:6px 0;">${l.research_summary || ""}</p>
-              ${l.outreach_body ? `<div class="msg-box"><strong>Outreach (${l.outreach_status} - ${l.outreach_note || "Ready"}):</strong>\nSubject: ${l.outreach_subject}\n\n${l.outreach_body}</div>` : ""}
+            <div class="lead-card">
+              <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+                <strong>${l.business_name}</strong>
+                <span class="badge">${l.matched_service}</span>
+              </div>
+              <div style="color:#94a3b8;font-size:13px;margin-top:4px;">
+                Location: ${l.city || "Global"}, ${l.country || ""} | Category: ${l.category || "N/A"} | Email: ${l.email || "N/A"}
+              </div>
+              <p style="font-size:13px;margin:8px 0;">${l.research_summary || ""}</p>
+              ${l.outreach_body ? `<div class="msg-box"><strong>Message [${l.outreach_status}]:</strong> ${l.outreach_note || ""}\nSubject: ${l.outreach_subject}\n\n${l.outreach_body}</div>` : ""}
             </div>
-          `).join("") : "<p style='color:#94a3b8;'>Click START AI CLIENT HUNTING and wait 30 seconds.</p>";
+          `).join("") : "<p style='color:#94a3b8;'>Click START AI CLIENT HUNTING to discover global clients and generate messages.</p>";
 
           const cRes = await fetch("/api/conversations", { headers });
           const convs = await cRes.json();
           document.getElementById("convList").innerHTML = convs.map(c => `
-            <div class="lead-item">
-              <strong>${c.business_name}</strong> [${c.channel} | ${c.direction} | Intent: ${c.intent}] ${c.needs_human_attention ? "⚠️ HUMAN ALERT" : ""}<br/>
+            <div class="lead-card">
+              <strong>${c.business_name}</strong> [${c.direction} | ${c.intent}] ${c.needs_human_attention ? "⚠️ HUMAN ALERT" : ""}<br/>
               <div class="msg-box">${c.message_text}</div>
             </div>
           `).join("");
@@ -434,7 +627,7 @@ def home():
             },
             body: JSON.stringify({ active: !isHunting })
           });
-          await loadAll();
+          setTimeout(loadAll, 2000);
         }
 
         async function simulateReply() {
