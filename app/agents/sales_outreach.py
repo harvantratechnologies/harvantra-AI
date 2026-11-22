@@ -5,30 +5,48 @@ import httpx
 from app.config import settings
 from app.models import Lead, ServiceCatalog
 
+COMPANY_WEBSITE = "https://harvantratechnologies.github.io/"
+FOUNDER_LINKEDIN = "https://www.linkedin.com/in/haris-hassan-65b0523a8/"
+COMPANY_GITHUB = "https://github.com/harvantratechnologies"
+
+
+def _ensure_links(text: str) -> str:
+    links_block = (
+        f"\n\nHarvantra Technologies Links:\n"
+        f"- Website: {COMPANY_WEBSITE}\n"
+        f"- LinkedIn: {FOUNDER_LINKEDIN}\n"
+        f"- GitHub Portfolio: {COMPANY_GITHUB}"
+    )
+    out = text.strip()
+    if COMPANY_WEBSITE not in out:
+        out += f"\nWebsite: {COMPANY_WEBSITE}"
+    if FOUNDER_LINKEDIN not in out:
+        out += f"\nLinkedIn: {FOUNDER_LINKEDIN}"
+    if COMPANY_GITHUB not in out:
+        out += f"\nGitHub: {COMPANY_GITHUB}"
+    if "Unsubscribe" not in out:
+        out += f"\n\nReply 'Unsubscribe' if you do not wish to receive future messages.{links_block}"
+    return out
+
 
 def generate_personalized_outreach(lead: Lead, service: ServiceCatalog) -> Dict:
+    location_label = f"{lead.city}, {lead.country}" if lead.city and lead.country else (lead.city or lead.country or "globally")
     fallback_subject = f"{service.name} for {lead.business_name} | Harvantra Technologies"
-    fallback_email = (
-        f"Assalam-o-Alaikum / Hello {lead.business_name} Team,\n\n"
-        f"I am Haris Hassan, Founder of Harvantra Technologies. While reviewing public business information "
-        f"for organizations in {lead.city or 'Pakistan'}, I noticed your work in {lead.category or 'your sector'} "
-        f"and wanted to introduce our {service.name} service.\n\n"
-        f"{service.summary} This helps growing organizations strengthen reliability and security without unnecessary overhead.\n\n"
-        f"You can learn more about our work here:\n"
-        f"- Website: https://harvantratechnologies.github.io/\n"
-        f"- Founder LinkedIn: https://www.linkedin.com/in/haris-hassan-65b0523a8/\n"
-        f"- GitHub: https://github.com/harvantratechnologies\n\n"
-        f"Would you be open to a brief 10-minute introductory call this week to discuss whether this fits your current priorities?\n\n"
+    fallback_email = _ensure_links(
+        f"Hello {lead.business_name} Team,\n\n"
+        f"I am Haris Hassan, Founder of Harvantra Technologies. While reviewing businesses operating in {location_label}, "
+        f"I noticed your presence in {lead.category or 'your industry'} and wanted to share how our {service.name} "
+        f"service can support your organization.\n\n"
+        f"{service.summary} {lead.match_reason or ''}\n\n"
+        f"Would you be open to a quick 10-minute discussion this week to explore if this aligns with your current goals?\n\n"
         f"Best regards,\n"
         f"Haris Hassan\n"
-        f"Founder, Harvantra Technologies\n\n"
-        f"---\n"
-        f"If you prefer not to receive future emails from us, simply reply with 'Unsubscribe'."
+        f"Founder, Harvantra Technologies"
     )
     fallback_whatsapp = (
-        f"Hello {lead.business_name} Team, I'm Haris Hassan, Founder of Harvantra Technologies "
-        f"(https://harvantratechnologies.github.io/). We help businesses in {lead.city or 'Pakistan'} with "
-        f"{service.name}. Would you like a quick overview of how we can support your team?"
+        f"Hello {lead.business_name}, I'm Haris Hassan (Founder, Harvantra Technologies). "
+        f"We help organizations in {location_label} with {service.name}. "
+        f"Website: {COMPANY_WEBSITE} | LinkedIn: {FOUNDER_LINKEDIN} | GitHub: {COMPANY_GITHUB}"
     )
 
     if not settings.GROQ_API_KEY:
@@ -39,25 +57,26 @@ def generate_personalized_outreach(lead: Lead, service: ServiceCatalog) -> Dict:
         }
 
     prompt = f"""
-Write a respectful, personalized, non-spam B2B outreach email and short WhatsApp template message on behalf of:
+Write a respectful, personalized B2B outreach email and short WhatsApp message on behalf of:
 - Founder: Haris Hassan
 - Company: Harvantra Technologies
-- Website: https://harvantratechnologies.github.io/
-- LinkedIn: https://www.linkedin.com/in/haris-hassan-65b0523a8/
-- GitHub: https://github.com/harvantratechnologies
+- Website: {COMPANY_WEBSITE}
+- LinkedIn: {FOUNDER_LINKEDIN}
+- GitHub Portfolio: {COMPANY_GITHUB}
 
-Prospect Details:
-- Business: {lead.business_name}
-- City: {lead.city}
+Target Business:
+- Name: {lead.business_name}
+- Location: {location_label}
 - Category: {lead.category}
 - Public Observation: {lead.research_summary}
-- Matched Service: {service.name} ({service.summary})
-- Why it fits: {lead.match_reason}
+- Target Service: #{service.number} {service.name} ({service.summary})
+- Relevance Note: {lead.match_reason}
 
 Rules:
-1. NEVER claim they have a vulnerability, hack, or security flaw.
-2. Keep the email concise (140-190 words), warm, professional, with a clear call to action and an unsubscribe line at the bottom.
-3. Return ONLY valid JSON with keys: "email_subject", "email_body", "whatsapp_body".
+1. NEVER claim they have a confirmed vulnerability or security breach.
+2. Include all three links ({COMPANY_WEBSITE}, {FOUNDER_LINKEDIN}, {COMPANY_GITHUB}) cleanly in the email.
+3. Keep the email clear, persuasive, and concise (130-180 words).
+4. Return ONLY valid JSON with keys: "email_subject", "email_body", "whatsapp_body".
 """
 
     try:
@@ -70,9 +89,9 @@ Rules:
                 },
                 json={
                     "model": settings.GROQ_MODEL,
-                    "temperature": 0.4,
+                    "temperature": 0.35,
                     "messages": [
-                        {"role": "system", "content": "Output valid JSON only."},
+                        {"role": "system", "content": "Output strict JSON only."},
                         {"role": "user", "content": prompt},
                     ],
                 },
@@ -86,9 +105,10 @@ Rules:
             content = resp.json()["choices"][0]["message"]["content"].strip()
             match = re.search(r"\{.*\}", content, re.DOTALL)
             parsed = json.loads(match.group(0) if match else content)
+            email_body = _ensure_links(str(parsed.get("email_body", fallback_email)))
             return {
                 "email_subject": str(parsed.get("email_subject", fallback_subject))[:250],
-                "email_body": str(parsed.get("email_body", fallback_email)),
+                "email_body": email_body,
                 "whatsapp_body": str(parsed.get("whatsapp_body", fallback_whatsapp)),
             }
     except Exception:
