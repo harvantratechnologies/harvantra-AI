@@ -31,7 +31,7 @@ from app.seed_services import seed_services
 
 DEFAULT_GLOBAL_CITIES = "Islamabad,Rawalpindi,Lahore,Karachi,Dubai,London,Riyadh,Toronto"
 
-app = FastAPI(title=settings.APP_NAME, version="1.0.0")
+app = FastAPI(title=settings.APP_NAME, version="1.0.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -70,14 +70,6 @@ def smtp_is_ready() -> bool:
         and os.getenv("SMTP_USER", "").strip()
         and os.getenv("SMTP_PASSWORD", "").strip()
     )
-
-
-def ensure_schema_columns(db: Session) -> None:
-    try:
-        db.execute(text("ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS selected_service_number INTEGER"))
-        db.commit()
-    except Exception:
-        db.rollback()
 
 
 def run_hunting_cycle() -> None:
@@ -208,10 +200,13 @@ def run_hunting_cycle() -> None:
 
 @app.on_event("startup")
 def on_startup():
+    with engine.begin() as conn:
+        conn.execute(
+            text("ALTER TABLE IF EXISTS system_settings ADD COLUMN IF NOT EXISTS selected_service_number INTEGER")
+        )
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
     try:
-        ensure_schema_columns(db)
         seed_services(db)
         setting = db.query(SystemSetting).first()
         if not setting:
