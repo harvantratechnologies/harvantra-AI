@@ -130,10 +130,20 @@ def _query_overpass(query: str) -> list[dict]:
 def hunt_businesses_worldwide(
     cities: list[str] | str | None = None,
     service_number: int | None = None,
-    limit_per_city: int = 8,
     *args,
     **kwargs,
 ) -> list[dict]:
+    raw_limit = kwargs.get("per_city_limit", kwargs.get("limit_per_city", 8))
+    try:
+        limit_per_city = max(1, int(raw_limit))
+    except Exception:
+        limit_per_city = 8
+
+    if cities is None and "cities" in kwargs:
+        cities = kwargs["cities"]
+    if service_number is None and "service_number" in kwargs:
+        service_number = kwargs["service_number"]
+
     if isinstance(cities, str):
         city_list = [c.strip() for c in cities.split(",") if c.strip()]
     elif isinstance(cities, list):
