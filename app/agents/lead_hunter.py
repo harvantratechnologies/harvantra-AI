@@ -1,10 +1,20 @@
 import re
 import httpx
-from bs4 import BeautifulSoup
 
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
-IGNORED_DOMAINS = ("example.com", "sentry.io", "wixpress.com", "schema.org", "w3.org", "google.com", "facebook.com")
+MAILTO_REGEX = re.compile(r'mailto:([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', re.IGNORECASE)
+IGNORED_DOMAINS = (
+    "example.com",
+    "sentry.io",
+    "wixpress.com",
+    "schema.org",
+    "w3.org",
+    "google.com",
+    "facebook.com",
+    "instagram.com",
+    "twitter.com",
+)
 
 
 def extract_email_from_website(website_url: str) -> str:
@@ -14,7 +24,7 @@ def extract_email_from_website(website_url: str) -> str:
         website_url = "https://" + website_url
 
     urls_to_try = [website_url.rstrip("/"), website_url.rstrip("/") + "/contact"]
-    headers = {"User-Agent": "Harvantra-Outreach-Bot/1.0 (+https://harvantratechnologies.github.io/)"}
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; HarvantraBot/1.0; +https://harvantratechnologies.github.io/)"}
 
     for url in urls_to_try:
         try:
@@ -22,22 +32,29 @@ def extract_email_from_website(website_url: str) -> str:
                 resp = client.get(url)
                 if resp.status_code >= 400:
                     continue
-                soup = BeautifulSoup(resp.text, "html.parser")
-                for a in soup.select("a[href^='mailto:']"):
-                    mail = a.get("href", "").replace("mailto:", "").split("?")[0].strip().lower()
-                    if EMAIL_REGEX.fullmatch(mail) and not any(d in mail for d in IGNORED_DOMAINS):
-                        return mail
-                matches = EMAIL_REGEX.findall(soup.get_text(" ", strip=True))
-                for m in matches:
-                    m_low = m.lower()
-                    if not any(d in m_low for d in IGNORED_DOMAINS) and not m_low.endswith((".png", ".jpg", ".svg")):
+                html = resp.text
+
+                for mail in MAILTO_REGEX.findall(html):
+                    m_low = mail.strip().lower()
+                    if EMAIL_REGEX.fullmatch(m_low) and not any(d in m_low for d in IGNORED_DOMAINS):
+                        return m_low
+
+                for mail in EMAIL_REGEX.findall(html):
+                    m_low = mail.strip().lower()
+                    if (
+                        not any(d in m_low for d in IGNORED_DOMAINS)
+                        and not m_low.endswith((".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".css", ".js"))
+                    ):
                         return m_low
         except Exception:
             continue
     return ""
 
 
-def discover_worldwide_businesses(cities: list[str], limit_per_city: int = 12) -> list[dict]:
+def hunt_businesses_worldwide(cities: list[str] | None = None, limit_per_city: int = 12) -> list[dict]:
+    if not cities:
+        cities = ["London", "New York", "Dubai", "Toronto", "Sydney", "Singapore"]
+
     results = []
     seen_emails = set()
 
@@ -46,7 +63,6 @@ def discover_worldwide_businesses(cities: list[str], limit_per_city: int = 12) -
         if not city:
             continue
 
-        # Discover ANY business (office, shop, clinic, agency, company) with email OR website
         query = f"""
         [out:json][timeout:25];
         area["name"="{city}"]["boundary"="administrative"]->.searchArea;
@@ -56,7 +72,9 @@ def discover_worldwide_businesses(cities: list[str], limit_per_city: int = 12) -
           node["name"]["contact:email"](area.searchArea);
           way["name"]["contact:email"](area.searchArea);
           node["name"]["website"]["office"](area.searchArea);
+          way["name"]["website"]["office"](area.searchArea);
           node["name"]["website"]["shop"](area.searchArea);
+          way["name"]["website"]["shop"](area.searchArea);
           node["name"]["website"]["amenity"](area.searchArea);
         );
         out center 40;
@@ -101,11 +119,14 @@ def discover_worldwide_businesses(cities: list[str], limit_per_city: int = 12) -
             results.append(
                 {
                     "company_name": name,
+                    "business_name": name,
                     "email": email,
                     "website": website,
                     "city": city,
+                    "location": city,
                     "country": tags.get("addr:country", ""),
                     "industry": category,
+                    "category": category,
                     "source": "overpass_global_crawler",
                 }
             )
