@@ -15,7 +15,7 @@ def send_email_via_smtp(to_email: str, subject: str, body: str) -> tuple[bool, s
     from_email = os.getenv("SMTP_FROM_EMAIL", smtp_user).strip()
 
     if not (smtp_host and smtp_user and smtp_password and from_email):
-        return False, "SMTP credentials not configured yet (saved as draft)."
+        return False, "SMTP credentials not configured (saved as draft)."
 
     msg = EmailMessage()
     msg["From"] = f"Haris Hassan - Harvantra Technologies <{from_email}>"
@@ -24,11 +24,16 @@ def send_email_via_smtp(to_email: str, subject: str, body: str) -> tuple[bool, s
     msg.set_content(body)
 
     try:
-        with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
-            server.starttls()
-            server.login(smtp_user, smtp_password)
-            server.send_message(msg)
-        return True, "Sent successfully"
+        if smtp_port == 465:
+            with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=20) as server:
+                server.login(smtp_user, smtp_password)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
+                server.starttls()
+                server.login(smtp_user, smtp_password)
+                server.send_message(msg)
+        return True, "Sent automatically"
     except Exception as exc:
         return False, str(exc)[:300]
 
@@ -41,7 +46,11 @@ def dispatch_email_outreach(db: Session, lead: Lead, outreach: OutreachMessage) 
         db.commit()
         return outreach
 
-    sent, info = send_email_via_smtp(lead.email, outreach.subject or "Harvantra Technologies", outreach.body)
+    sent, info = send_email_via_smtp(
+        lead.email,
+        outreach.subject or "Harvantra Technologies — IT & Security Solutions",
+        outreach.body,
+    )
     if sent:
         outreach.status = "sent"
         outreach.sent_at = datetime.utcnow()
