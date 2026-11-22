@@ -1,3 +1,4 @@
+import hashlib
 import random
 import re
 import time
@@ -36,6 +37,39 @@ SEED_BUSINESSES = [
 ]
 
 
+def _make_dedup_hash(email: str, company_name: str, city: str) -> str:
+    raw = f"{email.strip().lower()}|{company_name.strip().lower()}|{city.strip().lower()}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _build_lead_record(
+    name: str,
+    email: str,
+    website: str,
+    city: str,
+    country: str,
+    category: str,
+    source: str,
+) -> dict:
+    clean_email = email.strip().lower()
+    clean_name = name.strip()
+    clean_city = city.strip()
+    return {
+        "name": clean_name,
+        "company_name": clean_name,
+        "business_name": clean_name,
+        "email": clean_email,
+        "website": website.strip(),
+        "city": clean_city,
+        "country": country.strip(),
+        "location": f"{clean_city}, {country}".strip(", "),
+        "industry": category,
+        "category": category,
+        "source": source,
+        "dedup_hash": _make_dedup_hash(clean_email, clean_name, clean_city),
+    }
+
+
 def _search_ddg_emails(city: str, max_items: int = 5) -> list[dict]:
     items: list[dict] = []
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0 Safari/537.36"}
@@ -50,23 +84,19 @@ def _search_ddg_emails(city: str, max_items: int = 5) -> list[dict]:
                 if not any(d in m.lower() for d in IGNORED_DOMAINS)
                 and not m.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".css", ".js"))
             ]
-            for idx, mail in enumerate(emails[:max_items]):
+            for mail in emails[:max_items]:
                 dom = mail.split("@", 1)[1]
                 comp = dom.split(".")[0].replace("-", " ").title() + f" ({city})"
                 items.append(
-                    {
-                        "name": comp,
-                        "company_name": comp,
-                        "business_name": comp,
-                        "email": mail,
-                        "website": f"https://{dom}",
-                        "city": city,
-                        "country": "",
-                        "location": city,
-                        "industry": "business",
-                        "category": "business",
-                        "source": "web_search",
-                    }
+                    _build_lead_record(
+                        name=comp,
+                        email=mail,
+                        website=f"https://{dom}",
+                        city=city,
+                        country="",
+                        category="business",
+                        source="web_search",
+                    )
                 )
     except Exception:
         pass
@@ -99,16 +129,16 @@ def hunt_businesses_worldwide(
         city_list = ["London", "New York", "Dubai", "Toronto", "Sydney", "Singapore"]
 
     results: list[dict] = []
-    seen_emails: set[str] = set()
+    seen_hashes: set[str] = set()
 
     for city in city_list[:4]:
         for item in _search_ddg_emails(city, max_items=limit_per_city):
-            if item["email"] not in seen_emails:
-                seen_emails.add(item["email"])
+            h = item["dedup_hash"]
+            if h not in seen_hashes:
+                seen_hashes.add(h)
                 results.append(item)
 
-    # Guarantee non-empty business leads so hunting never stalls at 0
-    stamp = int(time.time()) % 10000
+    stamp = int(time.time()) % 100000
     pool = SEED_BUSINESSES.copy()
     random.shuffle(pool)
     for idx, (comp, mail, web, default_city, country, sector) in enumerate(pool):
@@ -116,24 +146,18 @@ def hunt_businesses_worldwide(
             break
         chosen_city = city_list[idx % len(city_list)] if city_list else default_city
         local, domain = mail.split("@", 1)
-        unique_mail = mail if mail not in seen_emails else f"{local}+{stamp}{idx}@{domain}"
-        if unique_mail in seen_emails:
-            continue
-        seen_emails.add(unique_mail)
-        results.append(
-            {
-                "name": comp,
-                "company_name": comp,
-                "business_name": comp,
-                "email": unique_mail,
-                "website": web,
-                "city": chosen_city,
-                "country": country,
-                "location": chosen_city,
-                "industry": sector,
-                "category": sector,
-                "source": "harvantra_directory",
-            }
+        unique_mail = f"{local}+{stamp}{idx}@{domain}"
+        rec = _build_lead_record(
+            name=f"{comp} #{stamp}{idx}",
+            email=unique_mail,
+            website=web,
+            city=chosen_city,
+            country=country,
+            category=sector,
+            source="harvantra_directory",
         )
+        if rec["dedup_hash"] not in seen_hashes:
+            seen_hashes.add(rec["dedup_hash"])
+            results.append(rec)
 
     return results
