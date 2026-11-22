@@ -2,13 +2,7 @@ import random
 import re
 import httpx
 
-OVERPASS_MIRRORS = [
-    "https://overpass-api.de/api/interpreter",
-    "https://overpass.kumi.systems/api/interpreter",
-]
-
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
-MAILTO_REGEX = re.compile(r"mailto:([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})", re.IGNORECASE)
 
 IGNORED_DOMAINS = (
     "example.com",
@@ -28,103 +22,155 @@ IGNORED_DOMAINS = (
     "cloudflare.com",
 )
 
-CITY_COORDS = {
-    "london": (51.5074, -0.1278, "United Kingdom"),
-    "new york": (40.7128, -74.0060, "United States"),
-    "dubai": (25.2048, 55.2708, "United Arab Emirates"),
-    "toronto": (43.6532, -79.3832, "Canada"),
-    "sydney": (-33.8688, 151.2093, "Australia"),
-    "singapore": (1.3521, 103.8198, "Singapore"),
-    "berlin": (52.5200, 13.4050, "Germany"),
-    "austin": (30.2672, -97.7431, "United States"),
-    "chicago": (41.8781, -87.6298, "United States"),
-    "san francisco": (37.7749, -122.4194, "United States"),
-    "amsterdam": (52.3676, 4.9041, "Netherlands"),
-    "paris": (48.8566, 2.3522, "France"),
-    "tokyo": (35.6762, 139.6503, "Japan"),
-    "riyadh": (24.7136, 46.6753, "Saudi Arabia"),
-    "doha": (25.2854, 51.5310, "Qatar"),
-    "islamabad": (33.6844, 73.0479, "Pakistan"),
-    "rawalpindi": (33.5651, 73.0169, "Pakistan"),
-    "lahore": (31.5204, 74.3587, "Pakistan"),
-    "karachi": (24.8607, 67.0011, "Pakistan"),
-}
+GLOBAL_CITIES = [
+    ("London", "United Kingdom"),
+    ("New York", "United States"),
+    ("Dubai", "United Arab Emirates"),
+    ("Toronto", "Canada"),
+    ("Sydney", "Australia"),
+    ("Singapore", "Singapore"),
+    ("Berlin", "Germany"),
+    ("Austin", "United States"),
+    ("Amsterdam", "Netherlands"),
+    ("Riyadh", "Saudi Arabia"),
+    ("Doha", "Qatar"),
+    ("Islamabad", "Pakistan"),
+    ("Lahore", "Pakistan"),
+    ("Karachi", "Pakistan"),
+]
+
+BUSINESS_SECTORS = [
+    "software company",
+    "digital marketing agency",
+    "logistics company",
+    "private clinic",
+    "e-commerce store",
+    "consulting firm",
+    "real estate agency",
+    "financial advisory",
+    "hospitality group",
+    "construction company",
+]
 
 
-def _resolve_city_coords(city: str) -> tuple[float, float, str] | None:
-    key = city.strip().lower()
-    if key in CITY_COORDS:
-        return CITY_COORDS[key]
+def _clean_domain(text: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9]", "", text.lower())
+    return cleaned[:24] if cleaned else ""
+
+
+def _fetch_ddg_businesses(city: str, sector: str, max_items: int = 6) -> list[dict]:
+    found: list[dict] = []
+    query = f'{sector} {city} "@" OR "info@" OR "contact@"'
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
     try:
-        with httpx.Client(
-            timeout=8.0,
-            headers={"User-Agent": "HarvantraAI/1.0 (+https://harvantratechnologies.github.io/)"},
-        ) as client:
-            r = client.get(
-                "https://nominatim.openstreetmap.org/search",
-                params={"q": city, "format": "json", "limit": 1, "addressdetails": 1},
-            )
-            data = r.json()
-            if data:
-                lat = float(data[0]["lat"])
-                lon = float(data[0]["lon"])
-                country = data[0].get("address", {}).get("country", "")
-                CITY_COORDS[key] = (lat, lon, country)
-                return lat, lon, country
+        with httpx.Client(timeout=12.0, follow_redirects=True, headers=headers) as client:
+            resp = client.get("https://html.duckduckgo.com/html/", params={"q": query})
+            if resp.status_code != 200:
+                return found
+            html = resp.text
+
+            # Extract emails directly from snippets
+            emails = [
+                m.lower()
+                for m in EMAIL_REGEX.findall(html)
+                if not any(d in m.lower() for d in IGNORED_DOMAINS)
+                and not m.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".js", ".css"))
+            ]
+
+            # Extract result titles as business names
+            raw_titles = re.findall(r'class="result__a"[^>]*>(.*?)</a>', html, re.DOTALL)
+            titles = [re.sub(r"<[^>]+>", "", t).strip() for t in raw_titles if re.sub(r"<[^>]+>", "", t).strip()]
+
+            for idx, mail in enumerate(emails[:max_items]):
+                biz_name = titles[idx] if idx < len(titles) else f"{city.title()} {sector.title()} #{idx + 1}"
+                biz_name = biz_name[:80]
+                domain = mail.split("@", 1)[1]
+                found.append(
+                    {
+                        "name": biz_name,
+                        "company_name": biz_name,
+                        "business_name": biz_name,
+                        "email": mail,
+                        "website": f"https://{domain}",
+                        "city": city,
+                        "country": "",
+                        "location": city,
+                        "industry": sector,
+                        "category": sector,
+                        "source": "harvantra_web_discovery",
+                    }
+                )
     except Exception:
         pass
-    return None
+    return found
 
 
-def extract_email_from_website(website_url: str) -> str:
-    if not website_url:
-        return ""
-    if not website_url.startswith(("http://", "https://")):
-        website_url = "https://" + website_url
-
-    base = website_url.rstrip("/")
-    urls_to_try = [base, base + "/contact", base + "/contact-us"]
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
+def _fetch_overpass_quick(city: str, max_items: int = 6) -> list[dict]:
+    city_coords = {
+        "london": (51.5074, -0.1278),
+        "new york": (40.7128, -74.0060),
+        "dubai": (25.2048, 55.2708),
+        "toronto": (43.6532, -79.3832),
+        "sydney": (-33.8688, 151.2093),
+        "singapore": (1.3521, 103.8198),
+        "berlin": (52.5200, 13.4050),
+        "austin": (30.2672, -97.7431),
+        "islamabad": (33.6844, 73.0479),
+        "lahore": (31.5204, 74.3587),
+        "karachi": (24.8607, 67.0011),
     }
+    coords = city_coords.get(city.strip().lower())
+    if not coords:
+        return []
 
-    for url in urls_to_try:
+    lat, lon = coords
+    query = f"""
+    [out:json][timeout:12];
+    (
+      node["name"]["email"](around:10000,{lat},{lon});
+      way["name"]["email"](around:10000,{lat},{lon});
+      node["name"]["contact:email"](around:10000,{lat},{lon});
+    );
+    out center 20;
+    """
+    out: list[dict] = []
+    for mirror in ("https://overpass-api.de/api/interpreter", "https://overpass.kumi.systems/api/interpreter"):
         try:
-            with httpx.Client(timeout=6.0, follow_redirects=True, headers=headers) as client:
-                resp = client.get(url)
-                if resp.status_code >= 400:
-                    continue
-                html = resp.text
-
-                for mail in MAILTO_REGEX.findall(html):
-                    m_low = mail.strip().lower()
-                    if EMAIL_REGEX.fullmatch(m_low) and not any(d in m_low for d in IGNORED_DOMAINS):
-                        return m_low
-
-                for mail in EMAIL_REGEX.findall(html):
-                    m_low = mail.strip().lower()
-                    if (
-                        not any(d in m_low for d in IGNORED_DOMAINS)
-                        and not m_low.endswith(
-                            (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".css", ".js", ".woff", ".ttf")
-                        )
-                    ):
-                        return m_low
+            with httpx.Client(timeout=14.0) as client:
+                r = client.post(mirror, data={"data": query})
+                if r.status_code == 200:
+                    for el in r.json().get("elements", []):
+                        if len(out) >= max_items:
+                            break
+                        tags = el.get("tags", {})
+                        name = (tags.get("name") or "").strip()
+                        email = (tags.get("email") or tags.get("contact:email") or "").strip().lower()
+                        if name and email and EMAIL_REGEX.fullmatch(email) and not any(d in email for d in IGNORED_DOMAINS):
+                            website = (tags.get("website") or tags.get("contact:website") or f"https://{email.split('@')[1]}").strip()
+                            cat = tags.get("office") or tags.get("shop") or tags.get("amenity") or "business"
+                            out.append(
+                                {
+                                    "name": name,
+                                    "company_name": name,
+                                    "business_name": name,
+                                    "email": email,
+                                    "website": website,
+                                    "city": city,
+                                    "country": tags.get("addr:country", ""),
+                                    "location": city,
+                                    "industry": cat,
+                                    "category": cat,
+                                    "source": "overpass_direct_email",
+                                }
+                            )
+                    if out:
+                        return out
         except Exception:
             continue
-    return ""
-
-
-def _query_overpass(query: str) -> list[dict]:
-    for mirror in OVERPASS_MIRRORS:
-        try:
-            with httpx.Client(timeout=20.0) as client:
-                resp = client.post(mirror, data={"data": query})
-                if resp.status_code == 200:
-                    return resp.json().get("elements", [])
-        except Exception:
-            continue
-    return []
+    return out
 
 
 def hunt_businesses_worldwide(
@@ -133,101 +179,55 @@ def hunt_businesses_worldwide(
     *args,
     **kwargs,
 ) -> list[dict]:
-    raw_limit = kwargs.get("per_city_limit", kwargs.get("limit_per_city", 8))
+    raw_limit = kwargs.get("per_city_limit", kwargs.get("limit_per_city", 6))
     try:
-        limit_per_city = max(1, int(raw_limit))
+        limit_per_city = max(1, min(15, int(raw_limit)))
     except Exception:
-        limit_per_city = 8
+        limit_per_city = 6
 
     if cities is None and "cities" in kwargs:
         cities = kwargs["cities"]
-    if service_number is None and "service_number" in kwargs:
-        service_number = kwargs["service_number"]
 
     if isinstance(cities, str):
-        city_list = [c.strip() for c in cities.split(",") if c.strip()]
+        parsed = [(c.strip(), "") for c in cities.split(",") if c.strip()]
     elif isinstance(cities, list):
-        city_list = [str(c).strip() for c in cities if str(c).strip()]
+        parsed = [(str(c).strip(), "") for c in cities if str(c).strip()]
     else:
-        city_list = ["London", "New York", "Dubai", "Toronto", "Sydney", "Singapore"]
+        parsed = []
 
-    if not city_list:
-        city_list = ["London", "New York", "Dubai", "Toronto", "Sydney", "Singapore"]
-
-    random.shuffle(city_list)
+    target_cities = parsed if parsed else GLOBAL_CITIES
+    random.shuffle(target_cities)
+    sectors = BUSINESS_SECTORS.copy()
+    random.shuffle(sectors)
 
     results: list[dict] = []
     seen_emails: set[str] = set()
 
-    for city in city_list[:4]:
-        coords = _resolve_city_coords(city)
-        if not coords:
-            continue
-        lat, lon, default_country = coords
+    for city, default_country in target_cities[:4]:
+        city_leads: list[dict] = []
 
-        query = f"""
-        [out:json][timeout:18];
-        (
-          node["name"]["email"](around:8000,{lat},{lon});
-          way["name"]["email"](around:8000,{lat},{lon});
-          node["name"]["contact:email"](around:8000,{lat},{lon});
-          way["name"]["contact:email"](around:8000,{lat},{lon});
-          node["name"]["website"]["office"](around:8000,{lat},{lon});
-          way["name"]["website"]["office"](around:8000,{lat},{lon});
-          node["name"]["website"]["shop"](around:8000,{lat},{lon});
-          way["name"]["website"]["amenity"](around:8000,{lat},{lon});
-        );
-        out center 35;
-        """
+        # Source 1: Overpass direct emails
+        for item in _fetch_overpass_quick(city, max_items=limit_per_city):
+            mail = item["email"]
+            if mail not in seen_emails:
+                seen_emails.add(mail)
+                if not item.get("country") and default_country:
+                    item["country"] = default_country
+                city_leads.append(item)
+                if len(city_leads) >= limit_per_city:
+                    break
 
-        elements = _query_overpass(query)
-        random.shuffle(elements)
-
-        city_count = 0
-        for el in elements:
-            if city_count >= limit_per_city:
-                break
-            tags = el.get("tags", {})
-            name = tags.get("name", "").strip()
-            if not name:
-                continue
-
-            website = (tags.get("website") or tags.get("contact:website") or "").strip()
-            email = (tags.get("email") or tags.get("contact:email") or "").strip().lower()
-
-            if not email and website:
-                email = extract_email_from_website(website)
-
-            if not email or not EMAIL_REGEX.fullmatch(email):
-                continue
-            if any(d in email for d in IGNORED_DOMAINS) or email in seen_emails:
-                continue
-
-            seen_emails.add(email)
-            category = (
-                tags.get("office")
-                or tags.get("shop")
-                or tags.get("amenity")
-                or tags.get("craft")
-                or "business"
-            )
-            country = tags.get("addr:country") or default_country
-
-            results.append(
-                {
-                    "name": name,
-                    "company_name": name,
-                    "business_name": name,
-                    "email": email,
-                    "website": website,
-                    "city": city,
-                    "country": country,
-                    "location": f"{city}, {country}".strip(", "),
-                    "industry": category,
-                    "category": category,
-                    "source": "overpass_global_crawler",
-                }
-            )
-            city_count += 1
-
-    return results
+        # Source 2: Web search discovery across different business sectors
+        if len(city_leads) < limit_per_city:
+            for sector in sectors[:3]:
+                if len(city_leads) >= limit_per_city:
+                    break
+                for item in _fetch_ddg_businesses(city, sector, max_items=limit_per_city - len(city_leads)):
+                    mail = item["email"]
+                    if mail not in seen_emails:
+                        seen_emails.add(mail)
+                        if not item.get("country") and default_country:
+                            item["country"] = default_country
+                        city_leads.append(item)
+                        if len(city_leads) >= limit_per_city:
+                            break
