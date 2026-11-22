@@ -16,9 +16,14 @@ class SystemSetting(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     hunting_active = Column(Boolean, default=False, nullable=False)
+    selected_service_number = Column(Integer, nullable=True)  # None = All 30 services auto-match
     ai_provider = Column(String(30), default="groq", nullable=False)
-    target_cities = Column(String(255), default="Islamabad,Rawalpindi", nullable=False)
-    daily_email_limit = Column(Integer, default=25, nullable=False)
+    target_cities = Column(
+        String(255),
+        default="Islamabad,Rawalpindi,Lahore,Karachi,Dubai,London,Riyadh,Toronto",
+        nullable=False,
+    )
+    daily_email_limit = Column(Integer, default=30, nullable=False)
     daily_whatsapp_limit = Column(Integer, default=15, nullable=False)
     require_approval_for_quotes = Column(Boolean, default=True, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -46,9 +51,9 @@ class Lead(Base):
     phone = Column(String(60), nullable=True, index=True)
     category = Column(String(120), nullable=True)
     city = Column(String(100), nullable=True, index=True)
-    country = Column(String(100), default="Pakistan")
+    country = Column(String(100), default="Global")
     decision_maker = Column(String(200), nullable=True)
-    source = Column(String(80), default="openstreetmap")
+    source = Column(String(80), default="openstreetmap_overpass")
     dedup_hash = Column(String(128), unique=True, nullable=False, index=True)
 
     research_summary = Column(Text, nullable=True)
