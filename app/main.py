@@ -31,7 +31,7 @@ from app.seed_services import seed_services
 
 DEFAULT_GLOBAL_CITIES = "Islamabad,Rawalpindi,Lahore,Karachi,Dubai,London,Riyadh,Toronto"
 
-app = FastAPI(title=settings.APP_NAME, version="1.0.2")
+app = FastAPI(title=settings.APP_NAME, version="1.0.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -413,26 +413,232 @@ def list_conversations(db: Session = Depends(get_db), current_user: str = Depend
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    return """
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-      <meta charset="UTF-8" />
-      <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-      <title>Harvantra AI – Autonomous SaaS Command Center</title>
-      <style>
-        * { box-sizing: border-box; }
-        body { font-family: Inter, Arial, sans-serif; background: #070d19; color: #f1f5f9; margin: 0; padding: 20px; }
-        .wrap { max-width: 1120px; margin: 0 auto; }
-        .topbar { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; background: #0f172a; border: 1px solid #1e293b; padding: 18px 22px; border-radius: 14px; margin-bottom: 18px; }
-        .brand h1 { margin: 0; font-size: 20px; color: #38bdf8; }
-        .brand p { margin: 4px 0 0; font-size: 13px; color: #94a3b8; }
-        .links a { color: #93c5fd; text-decoration: none; margin-left: 14px; font-size: 13px; }
-        .grid4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin-bottom: 18px; }
-        .stat { background: #0f172a; border: 1px solid #1e293b; border-radius: 12px; padding: 16px; }
-        .stat .label { font-size: 12px; color: #94a3b8; text-transform: uppercase; }
-        .stat .val { font-size: 26px; font-weight: bold; margin-top: 6px; color: #f8fafc; }
-        .card { background: #0f172a; border: 1px solid #1e293b; border-radius: 14px; padding: 20px; margin-bottom: 18px; }
-        h2, h3 { margin-top: 0; }
-        select, input, textarea { width: 100%; padding: 11px 12px; margin: 8px 0 14px; border-radius: 9px; border: 1px solid #334155; background: #070d19; color: #f8fafc; font-size: 14px; }
-        button { padding: 12px 18px; border: none; border-radius: 9px; background: #2563eb; color: #fff; font-weight: 600; cursor: pointer; font-size: 14
+    html = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Harvantra AI - Autonomous SaaS Command Center</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: Inter, Arial, sans-serif; background: #070d19; color: #f1f5f9; margin: 0; padding: 20px; }
+    .wrap { max-width: 1120px; margin: 0 auto; }
+    .topbar { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; background: #0f172a; border: 1px solid #1e293b; padding: 18px 22px; border-radius: 14px; margin-bottom: 18px; }
+    .brand h1 { margin: 0; font-size: 20px; color: #38bdf8; }
+    .brand p { margin: 4px 0 0; font-size: 13px; color: #94a3b8; }
+    .links a { color: #93c5fd; text-decoration: none; margin-left: 14px; font-size: 13px; }
+    .grid4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin-bottom: 18px; }
+    .stat { background: #0f172a; border: 1px solid #1e293b; border-radius: 12px; padding: 16px; }
+    .stat .label { font-size: 12px; color: #94a3b8; text-transform: uppercase; }
+    .stat .val { font-size: 26px; font-weight: bold; margin-top: 6px; color: #f8fafc; }
+    .card { background: #0f172a; border: 1px solid #1e293b; border-radius: 14px; padding: 20px; margin-bottom: 18px; }
+    h2, h3 { margin-top: 0; }
+    select, input, textarea { width: 100%; padding: 11px 12px; margin: 8px 0 14px; border-radius: 9px; border: 1px solid #334155; background: #070d19; color: #f8fafc; font-size: 14px; }
+    button { padding: 12px 18px; border: none; border-radius: 9px; background: #2563eb; color: #fff; font-weight: 600; cursor: pointer; font-size: 14px; }
+    button:hover { background: #1d4ed8; }
+    .hunt-btn { width: 100%; background: #16a34a; font-size: 16px; padding: 15px; margin-top: 8px; }
+    .hunt-btn:hover { background: #15803d; }
+    .hunt-btn.stop { background: #dc2626; }
+    .hunt-btn.stop:hover { background: #b91c1c; }
+    .row2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; }
+    .lead-card { background: #070d19; border: 1px solid #1e293b; border-radius: 11px; padding: 15px; margin-top: 12px; }
+    .badge { display: inline-block; padding: 3px 9px; border-radius: 999px; font-size: 11px; font-weight: 600; background: #1e293b; color: #38bdf8; }
+    .msg-box { background: #0d1526; border-left: 3px solid #38bdf8; padding: 12px; margin-top: 10px; border-radius: 6px; font-size: 13px; white-space: pre-wrap; line-height: 1.45; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card" id="loginBox" style="max-width:440px; margin: 60px auto;">
+      <h2>Harvantra AI Login</h2>
+      <p style="color:#94a3b8;font-size:14px;">Sign in to your autonomous client acquisition dashboard</p>
+      <input id="username" placeholder="Username" />
+      <input id="password" type="password" placeholder="Password" />
+      <button style="width:100%;" onclick="login()">Login to Dashboard</button>
+      <p id="loginMsg" style="color:#f87171;margin-top:10px;"></p>
+    </div>
+
+    <div id="dashBox" style="display:none;">
+      <div class="topbar">
+        <div class="brand">
+          <h1>Harvantra AI - Autonomous Client Engine</h1>
+          <p>Founder: Haris Hassan | Worldwide Client Hunting &amp; 30-Service Outreach</p>
+        </div>
+        <div class="links">
+          <a href="https://harvantratechnologies.github.io/" target="_blank">Website</a>
+          <a href="https://www.linkedin.com/in/haris-hassan-65b0523a8/" target="_blank">LinkedIn</a>
+          <a href="https://github.com/harvantratechnologies" target="_blank">GitHub</a>
+        </div>
+      </div>
+
+      <div class="grid4">
+        <div class="stat"><div class="label">Total Leads</div><div class="val" id="mLeads">0</div></div>
+        <div class="stat"><div class="label">Auto-Emails Sent</div><div class="val" id="mSent">0</div></div>
+        <div class="stat"><div class="label">SMTP Auto-Send</div><div class="val" id="mSmtp">OFF</div></div>
+        <div class="stat"><div class="label">Human Alerts</div><div class="val" id="mAlerts">0</div></div>
+      </div>
+
+      <div class="card">
+        <h3>1. Select Service &amp; Worldwide Targets</h3>
+        <div class="row2">
+          <div>
+            <label style="font-size:13px;color:#cbd5e1;">Choose Service (All 30 or Specific 1-30)</label>
+            <select id="serviceSelect"></select>
+          </div>
+          <div>
+            <label style="font-size:13px;color:#cbd5e1;">Target Worldwide Cities (comma separated)</label>
+            <input id="citiesInput" placeholder="Dubai,London,Riyadh,Toronto,Islamabad,Lahore,Karachi" />
+          </div>
+        </div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;">
+          <button onclick="saveConfig()">Save Service &amp; Cities</button>
+          <button onclick="loadAll()" style="background:#334155;">Refresh Dashboard</button>
+        </div>
+
+        <button id="huntBtn" class="hunt-btn" onclick="toggleHunting()">START AI CLIENT HUNTING</button>
+        <p id="jobStatus" style="color:#94a3b8;font-size:13px;margin-top:10px;"></p>
+      </div>
+
+      <div class="card">
+        <h3>2. Discovered Worldwide Clients &amp; Personalized Outreach (With Your Links)</h3>
+        <div id="leadsList">Loading...</div>
+      </div>
+
+      <div class="card">
+        <h3>3. Client Reply Handler &amp; Conversation Log</h3>
+        <input id="simEmail" placeholder="Client Email" />
+        <textarea id="simMsg" rows="2" placeholder="Paste or simulate client reply..."></textarea>
+        <button onclick="simulateReply()">Process Client Reply</button>
+        <div id="convList" style="margin-top:12px;"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let token = "";
+    let isHunting = false;
+
+    async function login() {
+      const username = document.getElementById("username").value;
+      const password = document.getElementById("password").value;
+      const res = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        document.getElementById("loginMsg").innerText = data.detail || "Login failed";
+        return;
+      }
+      token = data.access_token;
+      document.getElementById("loginBox").style.display = "none";
+      document.getElementById("dashBox").style.display = "block";
+      await loadServices();
+      await loadAll();
+    }
+
+    async function loadServices() {
+      const res = await fetch("/api/services", {
+        headers: { "Authorization": "Bearer " + token }
+      });
+      const services = await res.json();
+      const sel = document.getElementById("serviceSelect");
+      sel.innerHTML = `<option value="">All 30 Harvantra Services (AI Auto-Match per Client)</option>` +
+        services.map(s => `<option value="${s.number}">#${s.number} - ${s.name}</option>`).join("");
+    }
+
+    async function saveConfig() {
+      const rawVal = document.getElementById("serviceSelect").value;
+      const service_number = rawVal ? parseInt(rawVal, 10) : null;
+      const target_cities = document.getElementById("citiesInput").value;
+      const res = await fetch("/api/hunting/configure", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer " + token
+        },
+        body: JSON.stringify({ service_number, target_cities })
+      });
+      if (res.ok) {
+        alert("Service & target cities saved!");
+        await loadAll();
+      }
+    }
+
+    async function loadAll() {
+      const headers = { "Authorization": "Bearer " + token };
+      const sRes = await fetch("/api/status", { headers });
+      const data = await sRes.json();
+
+      isHunting = data.hunting_active;
+      document.getElementById("mLeads").innerText = data.total_leads_count;
+      document.getElementById("mSent").innerText = data.emails_sent_automatically;
+      document.getElementById("mSmtp").innerText = data.smtp_auto_send_enabled ? "ACTIVE" : "DRAFT ONLY";
+      document.getElementById("mAlerts").innerText = data.needs_human_attention;
+      document.getElementById("citiesInput").value = data.target_cities || "";
+      if (data.selected_service_number) {
+        document.getElementById("serviceSelect").value = String(data.selected_service_number);
+      }
+
+      const btn = document.getElementById("huntBtn");
+      btn.innerText = isHunting ? "STOP AI CLIENT HUNTING (RUNNING AUTOMATICALLY)" : "START AI CLIENT HUNTING";
+      btn.className = isHunting ? "hunt-btn stop" : "hunt-btn";
+
+      const lastJob = data.last_job ? `${data.last_job.status}: ${data.last_job.details}` : "Ready for one-click hunt.";
+      document.getElementById("jobStatus").innerText = `Status: ${lastJob}`;
+
+      const lRes = await fetch("/api/leads", { headers });
+      const leads = await lRes.json();
+      const container = document.getElementById("leadsList");
+      container.innerHTML = leads.length ? leads.map(l => `
+        <div class="lead-card">
+          <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+            <strong>${l.business_name}</strong>
+            <span class="badge">${l.matched_service}</span>
+          </div>
+          <div style="color:#94a3b8;font-size:13px;margin-top:4px;">
+            Location: ${l.city || "Global"}, ${l.country || ""} | Category: ${l.category || "N/A"} | Email: ${l.email || "N/A"}
+          </div>
+          <p style="font-size:13px;margin:8px 0;">${l.research_summary || ""}</p>
+          ${l.outreach_body ? `<div class="msg-box"><strong>Message [${l.outreach_status}]:</strong> ${l.outreach_note || ""}\nSubject: ${l.outreach_subject}\n\n${l.outreach_body}</div>` : ""}
+        </div>
+      `).join("") : "<p style='color:#94a3b8;'>Click START AI CLIENT HUNTING to discover global clients and generate messages.</p>";
+
+      const cRes = await fetch("/api/conversations", { headers });
+      const convs = await cRes.json();
+      document.getElementById("convList").innerHTML = convs.map(c => `
+        <div class="lead-card">
+          <strong>${c.business_name}</strong> [${c.direction} | ${c.intent}] ${c.needs_human_attention ? "HUMAN ALERT" : ""}<br/>
+          <div class="msg-box">${c.message_text}</div>
+        </div>
+      `).join("");
+    }
+
+    async function toggleHunting() {
+      await fetch("/api/hunting/toggle", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer " + token
+        },
+        body: JSON.stringify({ active: !isHunting })
+      });
+      setTimeout(loadAll, 2000);
+    }
+
+    async function simulateReply() {
+      const sender_email = document.getElementById("simEmail").value;
+      const message_text = document.getElementById("simMsg").value;
+      const res = await fetch("/api/webhooks/inbound-reply", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sender_email, message_text, channel: "email" })
+      });
+      const data = await res.json();
+      alert(res.ok ? `Intent: ${data.intent} | Human Alert: ${data.needs_human_attention}` : data.detail);
+      await loadAll();
+    }
+  </script>
+</body>
+</html>"""
+    return html
